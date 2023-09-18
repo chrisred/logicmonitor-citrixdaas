@@ -1,0 +1,47 @@
+{
+    "extends": "recommended",
+    "rules": {
+        "BracesForForLoop": {
+            "enabled": false
+        },
+        "BracesForIfElse": {
+            "enabled": false
+        },
+        "BracesForMethod": {
+            "enabled": false
+        },
+        "BracesForTryCatchFinally": {
+            "enabled": false
+        },
+        "CatchException": {
+            "enabled": false
+        },
+        "DuplicateNumberLiteral": {
+            "enabled": false
+        },
+        "DuplicateStringLiteral": {
+            "enabled": false
+        },
+        "Instanceof": {
+            "enabled": false
+        },
+        "NoDef": {
+            "enabled": false
+        },
+        "NoWildcardImports": {
+            "enabled": false
+        },
+        "ThrowException": {
+            "enabled": false
+        },
+        "UnnecessaryGetter": {
+            "enabled": false
+        },
+        "UnnecessarySetter": {
+            "enabled": false
+        },
+        "VariableTypeRequired": {
+            "enabled": false
+        }
+    }
+}
