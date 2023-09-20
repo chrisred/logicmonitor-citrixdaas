@@ -1,0 +1,1150 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<feed  version="1.0" hasPendingRequests="false" >
+  <company></company>
+  <status>200</status>
+  <errmsg>OK</errmsg>
+  <interval>0</interval>
+    <entry type="predatasource">
+        <version>1695237087</version>
+        <name>CitrixDaaS_ConnectionFailures</name>
+        <displayedas>Citrix DaaS Connection Failures</displayedas>
+        <description>Connection failures at the Site and Delivery Group level.</description>
+        <collector>batchscript</collector>
+        <hasMultiInstances>true</hasMultiInstances>
+        <useWildValueAsUniqueIdentifier>true</useWildValueAsUniqueIdentifier>
+        <schedule>300</schedule>
+        <appliesTo>hasCategory(&#34;CitrixDaaS&#34;)</appliesTo>
+        <wildcardauto>true</wildcardauto>
+        <wildcardpersist>false</wildcardpersist>
+        <wildcardlinuxscript>ad_script</wildcardlinuxscript>
+        <wildcardlinuxcmdline>type=&#34;embeded&#34; </wildcardlinuxcmdline>
+        <wildcardwinscript>ad_script</wildcardwinscript>
+        <wildcardwincmdline>type=&#34;embeded&#34; </wildcardwincmdline>
+        <wildcardgroovyscript>// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas
+
+import com.santaba.agent.util.script.ScriptCache
+import groovy.json.JsonSlurper
+import org.apache.http.client.utils.URIBuilder
+import org.apache.http.message.BasicNameValuePair
+
+// core http classes
+import org.apache.http.auth.AuthScope
+import org.apache.http.auth.Credentials
+import org.apache.http.auth.NTCredentials
+import org.apache.http.client.config.*
+import org.apache.http.client.entity.*
+import org.apache.http.client.methods.*
+import org.apache.http.client.ServiceUnavailableRetryStrategy
+import org.apache.http.conn.ssl.NoopHostnameVerifier
+import org.apache.http.conn.ssl.TrustSelfSignedStrategy
+import org.apache.http.entity.*
+import org.apache.http.Header
+import org.apache.http.HttpResponse
+import org.apache.http.impl.client.BasicCredentialsProvider
+import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.client.HttpClientBuilder
+import org.apache.http.impl.client.StandardHttpRequestRetryHandler
+import org.apache.http.ssl.SSLContextBuilder
+import org.apache.http.util.EntityUtils
+
+// LM properties
+def propDeviceId = hostProps.get(&#39;system.deviceId&#39;)
+def propSystemHost = hostProps.get(&#39;system.hostname&#39;)
+def propHost = hostProps.get(&#39;citrixdaas.host&#39;) ?: propSystemHost
+def propClientId = hostProps.get(&#39;citrixdaas.api.id&#39;)
+def propClientSecret = hostProps.get(&#39;citrixdaas.api.key&#39;)
+def propCustomerId = hostProps.get(&#39;citrixdaas.customerid&#39;)
+def propUser = hostProps.get(&#39;citrixdaas.user&#39;)
+def propPass = hostProps.get(&#39;citrixdaas.pass&#39;)
+def propScheme = hostProps.get(&#39;citrixdaas.usehttp&#39;) ? &#39;http&#39; : &#39;https&#39;
+
+def isCitrixCloud = propClientId &#38;&#38; propClientSecret &#38;&#38; propCustomerId
+def sessionToken = &#39;&#39;
+def ntCredentials = null
+
+def lifecycleStateMap = [
+    0: &#39;Active&#39;,
+    1: &#39;Deleted&#39;,
+    2: &#39;Requires Resolution&#39;,
+    3: &#39;Stub&#39;
+]
+
+def sessionSupportMap = [
+    0: &#39;Unknown&#39;,
+    1: &#39;Single Session&#39;,
+    2: &#39;Multi Session&#39;
+]
+
+def deliveryTypeMap = [
+    0: &#39;Desktops Only&#39;,
+    1: &#39;Apps Only&#39;,
+    2: &#39;Desktops and Apps&#39;
+]
+
+def desktopKindMap = [
+    0: &#39;Private&#39;,
+    1: &#39;Shared&#39;
+]
+
+try
+{
+    def mainUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(propHost)
+        .setPath(&#39;/monitorodata/DesktopGroups&#39;)
+
+    if (isCitrixCloud)
+    {
+        // get session token for Citrix Cloud API
+        sessionToken = getCachedToken(propDeviceId) ?:
+            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)
+
+        if (sessionToken == &#39;&#39;)
+        {
+            println &#39;Error: Invalid session token).&#39;
+            return 2
+        }
+    }
+    else
+    {
+        // modify request for an on-prem delivery controller
+        mainUriBuilder.setScheme(propScheme)
+        mainUriBuilder.setPath(&#39;/Citrix/Monitor/OData/v4/Data/DesktopGroups&#39;)
+
+        def credDomain = null
+        if (propUser.contains(&#39;\\&#39;))
+        {
+            credDomain = propUser.tokenize(&#39;\\&#39;)[0]
+            credUser = propUser.tokenize(&#39;\\&#39;)[1]
+        }
+        else
+        {
+            throw new Exception(&#34;The &#39;citrixdaas.user&#39; property must be in the DOMAIN\\User format.&#34;)
+        }
+
+        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)
+    }
+
+    def mainUri = mainUriBuilder.build()
+    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)
+
+    if (mainResponse.code == 429)
+    {
+        // rate limit response code
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 3
+    }
+    else if (mainResponse.code != 200)
+    {
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 4
+    }
+
+    // hard-coded instance for the site-wide total
+    println &#39;00000000-0000-0000-0000-000000000000##Site Total######citrixdaas.lifecyclestate=Active&#39;
+
+    mainResponse.json.value.each { group -&#62;
+        def wildValue = group.Id
+        def wildAlias = group.Name
+
+        def instanceProperties = [
+            &#39;citrixdaas.sessionsupport&#39; : sessionSupportMap.get(group.SessionSupport),
+            &#39;citrixdaas.deliverytype&#39; : deliveryTypeMap.get(group.DeliveryType),
+            &#39;citrixdaas.desktopkind&#39; : desktopKindMap.get(group.DesktopKind),
+            &#39;citrixdaas.lifecyclestate&#39; : lifecycleStateMap.get(group.LifecycleState)
+        ]
+
+        // Encode the instance property strings to escape any HTTP/URL special characters, the wild value/alias strings
+        // appear to be encoded by LogicMontor automatically.
+        instanceProperyStrings = instanceProperties.collect { property, value -&#62;
+            URLEncoder.encode(property, &#39;UTF-8&#39;) + &#39;=&#39; + URLEncoder.encode(value.toString(), &#39;UTF-8&#39;)
+        }
+
+        println &#34;${wildValue}##${wildAlias}######${instanceProperyStrings.join(&#39;&#38;&#39;)}&#34;
+    }
+
+    return 0
+}
+catch (Exception e)
+{
+    println e
+    return 1
+}
+
+String getCachedToken(String deviceId)
+{
+    def cache = ScriptCache.getCache()
+    def cacheValue = cache.get(&#34;CitrixDaasToken${deviceId}&#34;)
+
+    return cacheValue ?: &#39;&#39;
+}
+
+String getSessionToken(String host, String clientId, String clientSecret, String customerId)
+{
+    def sessionToken = &#39;&#39;
+
+    def postUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(host)
+        .setPath(&#34;/cctrustoauth2/${customerId}/tokens/clients&#34;)
+
+    def postData = []
+    postData.add(new BasicNameValuePair(&#39;grant_type&#39;, &#39;client_credentials&#39;))
+    postData.add(new BasicNameValuePair(&#39;client_id&#39;, clientId))
+    postData.add(new BasicNameValuePair(&#39;client_secret&#39;, clientSecret))
+    def postEntity = new UrlEncodedFormEntity(postData)
+
+    def httpPost = new HttpPost(postUriBuilder.build())
+    httpPost.setHeader(&#39;Accept&#39;, &#39;application/json&#39;)
+    httpPost.setHeader(&#39;Content-Type&#39;, &#39;application/x-www-form-urlencoded&#39;)
+
+    def postResponse = runRequest(httpPost, null, postEntity)
+
+    if (postResponse.code == 200)
+    {
+        def jsonSlurper = new JsonSlurper()
+        def jsonResponse = jsonSlurper.parseText(postResponse.body)
+        sessionToken = jsonResponse.access_token
+    }
+
+    return sessionToken
+}
+
+Map runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)
+{
+    def uriString = uri.toString()
+    def responseMap = [
+        code: null,
+        json: null
+    ]
+
+    while (true)
+    {
+        def httpGet = new HttpGet(uriString)
+
+        if (isCloud)
+        {
+            httpGet.addHeader(&#39;Authorization&#39; , &#34;CwsAuth Bearer=${token}&#34;)
+            httpGet.addHeader(&#39;Citrix-CustomerId&#39; , customerId)
+        }
+
+        def response = runRequest(httpGet, credentials)
+        def jsonSlurper = new JsonSlurper()
+        def json = jsonSlurper.parseText(response.body)
+
+        if (responseMap.code == null)
+        {
+            // a null value in responseMap means this is the first page
+            responseMap.code = response.code
+            responseMap.json = json
+        }
+        else
+        {
+            // for additional pages append the &#34;json.value&#34; list to the existing list
+            responseMap.code = response.code
+            responseMap.json.value.addAll(json.value)
+        }
+
+        if (responseMap.code != 200)
+        {
+            // response is bad, stop now and return as we dont have the full result set
+            return responseMap
+        }
+
+        if (json.get(&#39;@odata.nextLink&#39;) != null)
+        {
+            uriString = json[&#39;@odata.nextLink&#39;]
+        }
+        else
+        {
+            // no &#34;nextLink&#34; means all pages have been queried
+            return responseMap
+        }
+    }
+}
+
+Map runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)
+{
+    if (request instanceof HttpGet != true)
+    {
+        request.setEntity(entity)
+    }
+
+    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion
+    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient
+    def waitPeriod = 0L
+    def serviceRetry = [
+        retryRequest: { response, executionCount, context -&#62;
+            // increase the wait for each try, here we would wait 10, 20 and 30 seconds
+            waitPeriod += 10000L
+            def statusCode = response.getStatusLine().getStatusCode()
+            return executionCount &#60;= 3 &#38;&#38; (statusCode == 429 || statusCode == 500 || statusCode == 503)
+        },
+        getRetryInterval: {
+            return waitPeriod
+        }
+    ] as ServiceUnavailableRetryStrategy
+
+    // create an http client which retries for connection &#34;I/O&#34; errors and for certain http status codes
+    HttpClientBuilder httpClientBuilder = HttpClients.custom()
+        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
+        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))
+        .setServiceUnavailableRetryStrategy(serviceRetry)
+
+    // allow self-signed certificates
+    httpClientBuilder.setSSLContext(
+        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()
+    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+
+    if (credentials)
+    {
+        // attempt authentication with credentials supported by the BasicCredentialsProvider
+        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()
+        credentialProvider.setCredentials(AuthScope.ANY, credentials)
+        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)
+    }
+
+    CloseableHttpClient httpClient = httpClientBuilder.build()
+    HttpResponse response = httpClient.execute(request)
+    String responseBody = null
+
+    if (response.getEntity())
+    {
+        // only attempt to convert the body to string if there is content
+        responseBody = EntityUtils.toString(response.getEntity())
+    }
+
+    Integer code = response.getStatusLine().getStatusCode()
+    List&#60;Header&#62; headers = response.getAllHeaders()
+
+    def responseMap = [
+        code: code,
+        headers: headers,
+        body: responseBody,
+    ]
+
+    httpClient.close()
+    return responseMap
+}
+</wildcardgroovyscript>
+        <wildcardschedule>1440</wildcardschedule>
+        <wildcarddisable>false</wildcarddisable>
+        <wildcarddeleteinactive>false</wildcarddeleteinactive>
+        <agdmethod>ilp</agdmethod>
+        <agdparams>citrixdaas.deliverytype</agdparams>
+        <group></group>
+        <tags></tags>
+        <technology>Device Properties:
+
+– Citrix Cloud
+citrixdaas.api.id – Citrix Cloud API Client ID.
+citrixdaas.api.key – Citrix Cloud API Client Secret.
+citrixdaas.customerid – Citrix Cloud Customer ID.
+
+– On-prem
+citrixdaas.user – The user name in the NetBIOS DOMAIN\User form.
+citrixdaas.pass – The user password.
+citrixdaas.usehttps – Optional, connect to the Delivery Controller using HTTPS.
+
+– Both
+system.categories – Add &#34;CitrixDaaS&#34;.
+citrixdaas.host – Optional, defaults to the device IP when not set.
+citrixdass.connectionsearch – Optional, the period to look for failed connections, defaults to 60 minutes.
+
+Notes:
+
+For Citrix Cloud see the &#34;CitrixDaaS_Token&#34; DataSource for details on creating API credentials.
+
+For On-prem add the &#34;CitrixDaaS&#34; category and the user/pass properties to the device monitoring a Delivery Controller (DDC). The user account requires the Read Only Administrator role.
+
+Alerting should be enabled on either the &#34;Site Total&#34; instance or the delivery group instances to avoid duplicate alerts. Use Alert Tuning to set a threshold based on the needs of the environment.</technology>
+        <adlist><![CDATA[{"agdmethod":"ilp","method":"ad_script","agdparams":"citrixdaas.deliverytype","id":0,"filters":[{"attribute":"auto.citrixdaas.lifecyclestate","operation":"NotEqual","value":"Deleted"}],"params":{"type":"embeded","groovyscript":"// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas\n\nimport com.santaba.agent.util.script.ScriptCache\nimport groovy.json.JsonSlurper\nimport org.apache.http.client.utils.URIBuilder\nimport org.apache.http.message.BasicNameValuePair\n\n// core http classes\nimport org.apache.http.auth.AuthScope\nimport org.apache.http.auth.Credentials\nimport org.apache.http.auth.NTCredentials\nimport org.apache.http.client.config.*\nimport org.apache.http.client.entity.*\nimport org.apache.http.client.methods.*\nimport org.apache.http.client.ServiceUnavailableRetryStrategy\nimport org.apache.http.conn.ssl.NoopHostnameVerifier\nimport org.apache.http.conn.ssl.TrustSelfSignedStrategy\nimport org.apache.http.entity.*\nimport org.apache.http.Header\nimport org.apache.http.HttpResponse\nimport org.apache.http.impl.client.BasicCredentialsProvider\nimport org.apache.http.impl.client.CloseableHttpClient\nimport org.apache.http.impl.client.HttpClients\nimport org.apache.http.impl.client.HttpClientBuilder\nimport org.apache.http.impl.client.StandardHttpRequestRetryHandler\nimport org.apache.http.ssl.SSLContextBuilder\nimport org.apache.http.util.EntityUtils\n\n// LM properties\ndef propDeviceId = hostProps.get('system.deviceId')\ndef propSystemHost = hostProps.get('system.hostname')\ndef propHost = hostProps.get('citrixdaas.host') ?: propSystemHost\ndef propClientId = hostProps.get('citrixdaas.api.id')\ndef propClientSecret = hostProps.get('citrixdaas.api.key')\ndef propCustomerId = hostProps.get('citrixdaas.customerid')\ndef propUser = hostProps.get('citrixdaas.user')\ndef propPass = hostProps.get('citrixdaas.pass')\ndef propScheme = hostProps.get('citrixdaas.usehttp') ? 'http' : 'https'\n\ndef isCitrixCloud = propClientId && propClientSecret && propCustomerId\ndef sessionToken = ''\ndef ntCredentials = null\n\ndef lifecycleStateMap = [\n    0: 'Active',\n    1: 'Deleted',\n    2: 'Requires Resolution',\n    3: 'Stub'\n]\n\ndef sessionSupportMap = [\n    0: 'Unknown',\n    1: 'Single Session',\n    2: 'Multi Session'\n]\n\ndef deliveryTypeMap = [\n    0: 'Desktops Only',\n    1: 'Apps Only',\n    2: 'Desktops and Apps'\n]\n\ndef desktopKindMap = [\n    0: 'Private',\n    1: 'Shared'\n]\n\ntry\n{\n    def mainUriBuilder = new URIBuilder()\n        .setScheme('https')\n        .setHost(propHost)\n        .setPath('/monitorodata/DesktopGroups')\n\n    if (isCitrixCloud)\n    {\n        // get session token for Citrix Cloud API\n        sessionToken = getCachedToken(propDeviceId) ?:\n            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)\n\n        if (sessionToken == '')\n        {\n            println 'Error: Invalid session token).'\n            return 2\n        }\n    }\n    else\n    {\n        // modify request for an on-prem delivery controller\n        mainUriBuilder.setScheme(propScheme)\n        mainUriBuilder.setPath('/Citrix/Monitor/OData/v4/Data/DesktopGroups')\n\n        def credDomain = null\n        if (propUser.contains('\\\\'))\n        {\n            credDomain = propUser.tokenize('\\\\')[0]\n            credUser = propUser.tokenize('\\\\')[1]\n        }\n        else\n        {\n            throw new Exception(\"The 'citrixdaas.user' property must be in the DOMAIN\\\\User format.\")\n        }\n\n        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)\n    }\n\n    def mainUri = mainUriBuilder.build()\n    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)\n\n    if (mainResponse.code == 429)\n    {\n        // rate limit response code\n        println \"Error: Bad response code (${mainResponse.code}).\"\n        return 3\n    }\n    else if (mainResponse.code != 200)\n    {\n        println \"Error: Bad response code (${mainResponse.code}).\"\n        return 4\n    }\n\n    // hard-coded instance for the site-wide total\n    println '00000000-0000-0000-0000-000000000000##Site Total######citrixdaas.lifecyclestate=Active'\n\n    mainResponse.json.value.each { group ->\n        def wildValue = group.Id\n        def wildAlias = group.Name\n\n        def instanceProperties = [\n            'citrixdaas.sessionsupport' : sessionSupportMap.get(group.SessionSupport),\n            'citrixdaas.deliverytype' : deliveryTypeMap.get(group.DeliveryType),\n            'citrixdaas.desktopkind' : desktopKindMap.get(group.DesktopKind),\n            'citrixdaas.lifecyclestate' : lifecycleStateMap.get(group.LifecycleState)\n        ]\n\n        // Encode the instance property strings to escape any HTTP/URL special characters, the wild value/alias strings\n        // appear to be encoded by LogicMontor automatically.\n        instanceProperyStrings = instanceProperties.collect { property, value ->\n            URLEncoder.encode(property, 'UTF-8') + '=' + URLEncoder.encode(value.toString(), 'UTF-8')\n        }\n\n        println \"${wildValue}##${wildAlias}######${instanceProperyStrings.join('&')}\"\n    }\n\n    return 0\n}\ncatch (Exception e)\n{\n    println e\n    return 1\n}\n\nString getCachedToken(String deviceId)\n{\n    def cache = ScriptCache.getCache()\n    def cacheValue = cache.get(\"CitrixDaasToken${deviceId}\")\n\n    return cacheValue ?: ''\n}\n\nString getSessionToken(String host, String clientId, String clientSecret, String customerId)\n{\n    def sessionToken = ''\n\n    def postUriBuilder = new URIBuilder()\n        .setScheme('https')\n        .setHost(host)\n        .setPath(\"/cctrustoauth2/${customerId}/tokens/clients\")\n\n    def postData = []\n    postData.add(new BasicNameValuePair('grant_type', 'client_credentials'))\n    postData.add(new BasicNameValuePair('client_id', clientId))\n    postData.add(new BasicNameValuePair('client_secret', clientSecret))\n    def postEntity = new UrlEncodedFormEntity(postData)\n\n    def httpPost = new HttpPost(postUriBuilder.build())\n    httpPost.setHeader('Accept', 'application/json')\n    httpPost.setHeader('Content-Type', 'application/x-www-form-urlencoded')\n\n    def postResponse = runRequest(httpPost, null, postEntity)\n\n    if (postResponse.code == 200)\n    {\n        def jsonSlurper = new JsonSlurper()\n        def jsonResponse = jsonSlurper.parseText(postResponse.body)\n        sessionToken = jsonResponse.access_token\n    }\n\n    return sessionToken\n}\n\nMap runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)\n{\n    def uriString = uri.toString()\n    def responseMap = [\n        code: null,\n        json: null\n    ]\n\n    while (true)\n    {\n        def httpGet = new HttpGet(uriString)\n\n        if (isCloud)\n        {\n            httpGet.addHeader('Authorization' , \"CwsAuth Bearer=${token}\")\n            httpGet.addHeader('Citrix-CustomerId' , customerId)\n        }\n\n        def response = runRequest(httpGet, credentials)\n        def jsonSlurper = new JsonSlurper()\n        def json = jsonSlurper.parseText(response.body)\n\n        if (responseMap.code == null)\n        {\n            // a null value in responseMap means this is the first page\n            responseMap.code = response.code\n            responseMap.json = json\n        }\n        else\n        {\n            // for additional pages append the \"json.value\" list to the existing list\n            responseMap.code = response.code\n            responseMap.json.value.addAll(json.value)\n        }\n\n        if (responseMap.code != 200)\n        {\n            // response is bad, stop now and return as we dont have the full result set\n            return responseMap\n        }\n\n        if (json.get('@odata.nextLink') != null)\n        {\n            uriString = json['@odata.nextLink']\n        }\n        else\n        {\n            // no \"nextLink\" means all pages have been queried\n            return responseMap\n        }\n    }\n}\n\nMap runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)\n{\n    if (request instanceof HttpGet != true)\n    {\n        request.setEntity(entity)\n    }\n\n    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion\n    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient\n    def waitPeriod = 0L\n    def serviceRetry = [\n        retryRequest: { response, executionCount, context ->\n            // increase the wait for each try, here we would wait 10, 20 and 30 seconds\n            waitPeriod += 10000L\n            def statusCode = response.getStatusLine().getStatusCode()\n            return executionCount <= 3 && (statusCode == 429 || statusCode == 500 || statusCode == 503)\n        },\n        getRetryInterval: {\n            return waitPeriod\n        }\n    ] as ServiceUnavailableRetryStrategy\n\n    // create an http client which retries for connection \"I/O\" errors and for certain http status codes\n    HttpClientBuilder httpClientBuilder = HttpClients.custom()\n        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())\n        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))\n        .setServiceUnavailableRetryStrategy(serviceRetry)\n\n    // allow self-signed certificates\n    httpClientBuilder.setSSLContext(\n        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()\n    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)\n\n    if (credentials)\n    {\n        // attempt authentication with credentials supported by the BasicCredentialsProvider\n        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()\n        credentialProvider.setCredentials(AuthScope.ANY, credentials)\n        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)\n    }\n\n    CloseableHttpClient httpClient = httpClientBuilder.build()\n    HttpResponse response = httpClient.execute(request)\n    String responseBody = null\n\n    if (response.getEntity())\n    {\n        // only attempt to convert the body to string if there is content\n        responseBody = EntityUtils.toString(response.getEntity())\n    }\n\n    Integer code = response.getStatusLine().getStatusCode()\n    List<Header> headers = response.getAllHeaders()\n\n    def responseMap = [\n        code: code,\n        headers: headers,\n        body: responseBody,\n    ]\n\n    httpClient.close()\n    return responseMap\n}\n"}}]]></adlist>
+        <schemaVersion>2</schemaVersion>
+        <dataSourceType>1</dataSourceType>
+        <attributes>
+        <attribute>
+            <name>scripttype</name>
+            <value>embed</value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>scriptgroovy</name>
+            <value>// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas
+
+import com.santaba.agent.util.script.ScriptCache
+import groovy.json.JsonSlurper
+import java.time.format.DateTimeFormatter
+import java.time.ZonedDateTime
+import java.time.ZoneId
+import org.apache.http.client.utils.URIBuilder
+import org.apache.http.message.BasicNameValuePair
+
+// core http classes
+import org.apache.http.auth.AuthScope
+import org.apache.http.auth.Credentials
+import org.apache.http.auth.NTCredentials
+import org.apache.http.client.config.*
+import org.apache.http.client.entity.*
+import org.apache.http.client.methods.*
+import org.apache.http.client.ServiceUnavailableRetryStrategy
+import org.apache.http.conn.ssl.NoopHostnameVerifier
+import org.apache.http.conn.ssl.TrustSelfSignedStrategy
+import org.apache.http.entity.*
+import org.apache.http.Header
+import org.apache.http.HttpResponse
+import org.apache.http.impl.client.BasicCredentialsProvider
+import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.client.HttpClientBuilder
+import org.apache.http.impl.client.StandardHttpRequestRetryHandler
+import org.apache.http.ssl.SSLContextBuilder
+import org.apache.http.util.EntityUtils
+
+// LM properties
+def propDeviceId = hostProps.get(&#39;system.deviceId&#39;)
+def propSystemHost = hostProps.get(&#39;system.hostname&#39;)
+def propHost = hostProps.get(&#39;citrixdaas.host&#39;) ?: propSystemHost
+def propClientId = hostProps.get(&#39;citrixdaas.api.id&#39;)
+def propClientSecret = hostProps.get(&#39;citrixdaas.api.key&#39;)
+def propCustomerId = hostProps.get(&#39;citrixdaas.customerid&#39;)
+def propUser = hostProps.get(&#39;citrixdaas.user&#39;)
+def propPass = hostProps.get(&#39;citrixdaas.pass&#39;)
+def propScheme = hostProps.get(&#39;citrixdaas.usehttp&#39;) ? &#39;http&#39; : &#39;https&#39;
+def propCollectDuration = hostProps.get(&#39;citrixdass.connectionsearch&#39;)?.isInteger() ?
+    hostProps.get(&#39;citrixdass.connectionsearch&#39;).toInteger() : 60
+
+def isCitrixCloud = propClientId &#38;&#38; propClientSecret &#38;&#38; propCustomerId
+def sessionToken = &#39;&#39;
+def ntCredentials = null
+def dateFormat = DateTimeFormatter.ofPattern(&#34;yyyy-MM-dd&#39;T&#39;HH:mm:ss.SSSX&#34;)
+def utcNow = ZonedDateTime.now(ZoneId.of(&#39;UTC&#39;))
+def failureStartDate = utcNow.minusMinutes(propCollectDuration)
+def failureFormattedDate = failureStartDate.format(dateFormat)
+
+// the code from &#34;ConnectionFailureEnumValue&#34; is mapped to a failure type as shown in the link below
+// https://docs.citrix.com/en-us/xenapp-and-xendesktop/7-15-ltsr/director/failure_reasons_troubleshooting.html
+def failureTypeMap = [
+    [1]: &#39;None&#39;,
+    [4, 6, 7, 8, 23]: &#39;ClientConnectionFailure&#39;,
+    [2, 3, 17, 18, 19, 20, 101]: &#39;MachineFailure&#39;,
+    [12, 13, 21, 22, 24, 25, 100]: &#39;NoCapacityAvailable&#39;,
+    [5, 11]: &#39;NoLicensesAvailable&#39;,
+    [9, 10, 14, 15, 16]: &#39;Configuration&#39;,
+]
+
+try
+{
+    def mainUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(propHost)
+        .setPath(&#39;/monitorodata/ConnectionFailureLogs&#39;)
+        .setParameter(&#39;$select&#39;, &#39;ConnectionFailureEnumValue,FailureDate&#39;)
+        .setParameter(&#39;$expand&#39;, &#39;Session($expand=Machine($select=DesktopGroupId))&#39;)
+        .setParameter(&#39;$filter&#39;, &#34;FailureDate gt cast(${failureFormattedDate}, Edm.DateTimeOffset)&#34;)
+
+    if (isCitrixCloud)
+    {
+        // get session token for Citrix Cloud API
+        sessionToken = getCachedToken(propDeviceId) ?:
+            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)
+
+        if (sessionToken == &#39;&#39;)
+        {
+            println &#39;Error: Invalid session token.&#39;
+            return 2
+        }
+    }
+    else
+    {
+        // modify request for an on-prem delivery controller
+        mainUriBuilder.setScheme(propScheme)
+        mainUriBuilder.setPath(&#39;/Citrix/Monitor/OData/v4/Data/DesktopGroups&#39;)
+
+        def credDomain = null
+        if (propUser.contains(&#39;\\&#39;))
+        {
+            credDomain = propUser.tokenize(&#39;\\&#39;)[0]
+            credUser = propUser.tokenize(&#39;\\&#39;)[1]
+        }
+        else
+        {
+            throw new Exception(&#34;The &#39;citrixdaas.user&#39; property must be in the DOMAIN\\User format.&#34;)
+        }
+
+        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)
+    }
+
+    def mainUri = mainUriBuilder.build()
+    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)
+
+    if (mainResponse.code == 429)
+    {
+        // rate limit response code
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 3
+    }
+    else if (mainResponse.code != 200)
+    {
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 4
+    }
+
+    def connectionsByDesktopGroup = [:]
+    mainResponse.json.value.each { connection -&#62;
+        def desktopGroupId =  connection.Session.Machine.DesktopGroupId
+        def connectionList = connectionsByDesktopGroup.get(desktopGroupId, [])
+        connectionList &#60;&#60; connection
+        connectionsByDesktopGroup[desktopGroupId] = connectionList
+    }
+
+    connectionsByDesktopGroup.each { desktopGroupId, connections -&#62;
+        def wildValue = desktopGroupId
+
+        // initialise all the failure types with 0 to start
+        def failureTypeCount = [
+            [1]: 0,
+            [4, 6, 7, 8, 23]: 0,
+            [2, 3, 17, 18, 19, 20, 101]: 0,
+            [12, 13, 21, 22, 24, 25, 100]: 0,
+            [5, 11]: 0,
+            [9, 10, 14, 15, 16]: 0,
+        ]
+
+        // for each failure find the type it is associated with and increment the count for that type
+        connections.each { failure -&#62;
+            failureTypeMap.find {
+                failure[&#39;ConnectionFailureEnumValue&#39;] in it.key
+            }.each {
+                failureTypeCount[it.key] += 1
+            }
+        }
+
+        output(&#39;Total&#39;, connections.size(), wildValue)
+        // output metrics for each failure type
+        failureTypeCount.each {
+            output(failureTypeMap[it.key], it.value, wildValue)
+        }
+    }
+
+    // calculate total failues for the whole site
+    def failureTypeCount = [
+        [1]: 0,
+        [4, 6, 7, 8, 23]: 0,
+        [2, 3, 17, 18, 19, 20, 101]: 0,
+        [12, 13, 21, 22, 24, 25, 100]: 0,
+        [5, 11]: 0,
+        [9, 10, 14, 15, 16]: 0,
+    ]
+
+    mainResponse.json.value.each { failure -&#62;
+        failureTypeMap.find {
+            failure[&#39;ConnectionFailureEnumValue&#39;] in it.key
+        }.each {
+            failureTypeCount[it.key] += 1
+        }
+    }
+
+    output(&#39;Total&#39;, mainResponse.json.value.size(), &#39;00000000-0000-0000-0000-000000000000&#39;)
+    failureTypeCount.each {
+        output(failureTypeMap[it.key], it.value, &#39;00000000-0000-0000-0000-000000000000&#39;)
+    }
+
+    return 0
+}
+catch (Exception e)
+{
+    println e
+    return 1
+}
+
+String getCachedToken(String deviceId)
+{
+    def cache = ScriptCache.getCache()
+    def cacheValue = cache.get(&#34;CitrixDaasToken${deviceId}&#34;)
+
+    return cacheValue ?: &#39;&#39;
+}
+
+String getSessionToken(String host, String clientId, String clientSecret, String customerId)
+{
+    def sessionToken = &#39;&#39;
+
+    def postUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(host)
+        .setPath(&#34;/cctrustoauth2/${customerId}/tokens/clients&#34;)
+
+    def postData = []
+    postData.add(new BasicNameValuePair(&#39;grant_type&#39;, &#39;client_credentials&#39;))
+    postData.add(new BasicNameValuePair(&#39;client_id&#39;, clientId))
+    postData.add(new BasicNameValuePair(&#39;client_secret&#39;, clientSecret))
+    def postEntity = new UrlEncodedFormEntity(postData)
+
+    def httpPost = new HttpPost(postUriBuilder.build())
+    httpPost.setHeader(&#39;Accept&#39;, &#39;application/json&#39;)
+    httpPost.setHeader(&#39;Content-Type&#39;, &#39;application/x-www-form-urlencoded&#39;)
+
+    def postResponse = runRequest(httpPost, null, postEntity)
+
+    if (postResponse.code == 200)
+    {
+        def jsonSlurper = new JsonSlurper()
+        def jsonResponse = jsonSlurper.parseText(postResponse.body)
+        sessionToken = jsonResponse.access_token
+    }
+
+    return sessionToken
+}
+
+Map runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)
+{
+    def uriString = uri.toString()
+    def responseMap = [
+        code: null,
+        json: null
+    ]
+
+    while (true)
+    {
+        def httpGet = new HttpGet(uriString)
+
+        if (isCloud)
+        {
+            httpGet.addHeader(&#39;Authorization&#39; , &#34;CwsAuth Bearer=${token}&#34;)
+            httpGet.addHeader(&#39;Citrix-CustomerId&#39; , customerId)
+        }
+
+        def response = runRequest(httpGet, credentials)
+        def jsonSlurper = new JsonSlurper()
+        def json = jsonSlurper.parseText(response.body)
+
+        if (responseMap.code == null)
+        {
+            // a null value in responseMap means this is the first page
+            responseMap.code = response.code
+            responseMap.json = json
+        }
+        else
+        {
+            // for additional pages append the &#34;json.value&#34; list to the existing list
+            responseMap.code = response.code
+            responseMap.json.value.addAll(json.value)
+        }
+
+        if (responseMap.code != 200)
+        {
+            // response is bad, stop now and return as we dont have the full result set
+            return responseMap
+        }
+
+        if (json.get(&#39;@odata.nextLink&#39;) != null)
+        {
+            uriString = json[&#39;@odata.nextLink&#39;]
+        }
+        else
+        {
+            // no &#34;nextLink&#34; means all pages have been queried
+            return responseMap
+        }
+    }
+}
+
+Map runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)
+{
+    if (request instanceof HttpGet != true)
+    {
+        request.setEntity(entity)
+    }
+
+    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion
+    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient
+    def waitPeriod = 0L
+    def serviceRetry = [
+        retryRequest: { response, executionCount, context -&#62;
+            // increase the wait for each try, here we would wait 10, 20 and 30 seconds
+            waitPeriod += 10000L
+            def statusCode = response.getStatusLine().getStatusCode()
+            return executionCount &#60;= 3 &#38;&#38; (statusCode == 429 || statusCode == 500 || statusCode == 503)
+        },
+        getRetryInterval: {
+            return waitPeriod
+        }
+    ] as ServiceUnavailableRetryStrategy
+
+    // create an http client which retries for connection &#34;I/O&#34; errors and for certain http status codes
+    HttpClientBuilder httpClientBuilder = HttpClients.custom()
+        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
+        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))
+        .setServiceUnavailableRetryStrategy(serviceRetry)
+
+    // allow self-signed certificates
+    httpClientBuilder.setSSLContext(
+        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()
+    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+
+    if (credentials)
+    {
+        // attempt authentication with credentials supported by the BasicCredentialsProvider
+        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()
+        credentialProvider.setCredentials(AuthScope.ANY, credentials)
+        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)
+    }
+
+    CloseableHttpClient httpClient = httpClientBuilder.build()
+    HttpResponse response = httpClient.execute(request)
+    String responseBody = null
+
+    if (response.getEntity())
+    {
+        // only attempt to convert the body to string if there is content
+        responseBody = EntityUtils.toString(response.getEntity())
+    }
+
+    Integer code = response.getStatusLine().getStatusCode()
+    List&#60;Header&#62; headers = response.getAllHeaders()
+
+    def responseMap = [
+        code: code,
+        headers: headers,
+        body: responseBody,
+    ]
+
+    httpClient.close()
+    return responseMap
+}
+
+void output(key, value, instanceId=null)
+{
+    if (value instanceof BigDecimal)
+    {
+        // make sure BigDecimal does not render to string with Scientific Notation
+        value = value.toPlainString()
+    }
+
+    if (value instanceof Boolean)
+    {
+        value = value ? 1:0
+    }
+
+    if (instanceId)
+    {
+        println &#34;${instanceId}.${key}=${value}&#34;
+    }
+    else
+    {
+        println &#34;${key}=${value}&#34;
+    }
+}</value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>windowsscript</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>linuxscript</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>windowscmdline</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>linuxcmdline</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>__filter_0</name>
+            <value>auto.citrixdaas.lifecyclestate	NotEqual	Deleted</value>
+            <comment></comment>
+        </attribute>
+        </attributes>
+        <datapoints>
+        <datapoint>
+            <name>ClientConnectionFailure</name>
+            <originId>n48biFpsS-KuEQbB5rQCsA</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.ClientConnectionFailure</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS delivery group ##INSTANCE## monitored via ##HOST## has recorded ##VALUE## recent client failure connection errors, placing the delivery group into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The session failed to start.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>Configuration</name>
+            <originId>6TyyyAu-TcStbbofAseA0A</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.Configuration</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS delivery group ##INSTANCE## monitored via ##HOST## has recorded ##VALUE## recent configuration connection errors, placing the delivery group into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Configuration failure.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>ExitCode</name>
+            <originId>08GEF5gER-yV4MS0rC5Cvw</originId>
+            <dataType>4</dataType>
+            <type>2</type>
+            <postprocessormethod>none</postprocessormethod>
+            <postprocessorparam></postprocessorparam>
+            <usevalue>exitCode</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description></description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>MachineFailure</name>
+            <originId>11G8DaLARmui8zJnH5UGMA</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.MachineFailure</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS delivery group ##INSTANCE## monitored via ##HOST## has recorded ##VALUE## recent machine failure connection errors, placing the delivery group into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Machine failure.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>NoCapacityAvailable</name>
+            <originId>hnVzpd7sSJefxYnNAFRsGQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.NoCapacityAvailable</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS delivery group ##INSTANCE## monitored via ##HOST## has recorded ##VALUE## recent capacity connection errors, placing the delivery group into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>No available capacity to start or reconnect to a session.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>NoLicensesAvailable</name>
+            <originId>jR24XZ7_RG2eTU83TcZWVg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.NoLicensesAvailable</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS delivery group ##INSTANCE## monitored via ##HOST## has recorded ##VALUE## recent license connection errors, placing the delivery group into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>No Licenses available.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>None</name>
+            <originId>pHsyUX5RSXGGKnmxGXcKHQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.None</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS delivery group ##INSTANCE## monitored via ##HOST## has recorded ##VALUE## recent unknown connection errors, placing the delivery group into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>No reason given.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>Total</name>
+            <originId>bbL8TposROqldct1NHIWKg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.Total</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS delivery group ##INSTANCE## monitored via ##HOST## has recorded ##VALUE## recent logon failures placing the delivery group into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The total failed connections of any type.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        </datapoints>
+        <graphs>
+        <graph>
+            <name>Connection Failures</name>
+            <title>Connection Failures</title>
+            <originId></originId>            <verticallabel>count</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>1</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>ClientConnectionFailure</name>
+            <datapointname>ClientConnectionFailure</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>Configuration</name>
+            <datapointname>Configuration</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>MachineFailure</name>
+            <datapointname>MachineFailure</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>NoCapacityAvailable</name>
+            <datapointname>NoCapacityAvailable</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>NoLicensesAvailable</name>
+            <datapointname>NoLicensesAvailable</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>None</name>
+            <datapointname>None</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>3</type>
+                <legend>ClientConnectionFailure</legend>
+                <color>blue</color>
+                <datapointname>ClientConnectionFailure</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>Configuration</legend>
+                <color>green</color>
+                <datapointname>Configuration</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>MachineFailure</legend>
+                <color>green</color>
+                <datapointname>MachineFailure</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>NoCapacityAvailable</legend>
+                <color>red1</color>
+                <datapointname>NoCapacityAvailable</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>NoLicensesAvailable</legend>
+                <color>orange</color>
+                <datapointname>NoLicensesAvailable</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>None</legend>
+                <color>yellow</color>
+                <datapointname>None</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        </graphs>
+        <overviewgraphs>
+        <overviewgraph>
+            <name>Connection Failures</name>
+            <title>Connection Failures</title>
+            <verticallabel>count</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>1</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <aggregated>false</aggregated>
+            <originId></originId>
+            <datapoints>
+        <overviewgraphdatapoint>
+            <name>Total</name>
+            <datapointname>Total</datapointname>
+            <cf>1</cf>
+            <aggregateMethod>sum</aggregateMethod>
+            <originId></originId>
+        </overviewgraphdatapoint>
+            </datapoints>
+            <virtualdatapoints>
+            </virtualdatapoints>
+            <lines>
+            <overviewgraphline>
+                <type>1</type>
+                <legend>##INSTANCE##</legend>
+                <datapointname>Total</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+                <color>silver</color>
+            </overviewgraphline>
+            </lines>
+        </overviewgraph>
+        </overviewgraphs>
+        <scripts>
+        </scripts>
+    </entry>
+</feed>

@@ -1,0 +1,391 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<feed  version="1.0" hasPendingRequests="false" >
+  <company></company>
+  <status>200</status>
+  <errmsg>OK</errmsg>
+  <interval>0</interval>
+    <entry type="predatasource">
+        <version>1695237192</version>
+        <name>CitrixDaaS_Token</name>
+        <displayedas>Citrix DaaS Token</displayedas>
+        <description>Cache the Citrix Cloud API session token.</description>
+        <collector>script</collector>
+        <hasMultiInstances>false</hasMultiInstances>
+        <useWildValueAsUniqueIdentifier>false</useWildValueAsUniqueIdentifier>
+        <schedule>1200</schedule>
+        <appliesTo>hasCategory(&#34;CitrixDaaS&#34;) &#38;&#38; citrixdaas.api.id &#38;&#38; citrixdaas.api.key &#38;&#38; citrixdaas.customerid</appliesTo>
+        <wildcardauto>false</wildcardauto>
+        <wildcardpersist>false</wildcardpersist>
+        <wildcardlinuxscript></wildcardlinuxscript>
+        <wildcardlinuxcmdline></wildcardlinuxcmdline>
+        <wildcardwinscript></wildcardwinscript>
+        <wildcardwincmdline></wildcardwincmdline>
+        <wildcardgroovyscript></wildcardgroovyscript>
+        <wildcardschedule>1440</wildcardschedule>
+        <wildcarddisable>false</wildcarddisable>
+        <wildcarddeleteinactive>false</wildcarddeleteinactive>
+        <agdmethod>none</agdmethod>
+        <agdparams></agdparams>
+        <group></group>
+        <tags></tags>
+        <technology>Device Properties:
+
+system.categories – Add &#34;CitrixDaaS&#34;.
+citrixdaas.api.id – Citrix Cloud API Client ID.
+citrixdaas.api.key – Citrix Cloud API Client Secret.
+citrixdaas.customerid – Citrix Cloud Customer ID.
+citrixdaas.host – Optional, defaults to the device IP when not set.
+
+Notes:
+
+1. Generate API credentials from the &#34;Identity and Access Management&#34; menu within the Citrix Cloud tenant.
+
+2. From the &#34;Account Settings&#34; menu note the tenant Region.
+
+3. Add the &#34;CitrixDaaS&#34; category and other required properties to a device monitoring the correct API endpoint address. Currently the endpoint addresses are:
+
+api-ap-s.cloud.com – Asia Pacific South
+api-eu.cloud.com – European Union
+api-us.cloud.com – United States
+api.citrixcloud.jp – Japan
+
+The DataSource will then populate the Collector script cache with a Citrix Cloud session token. Other DataSources will attempt to use this cached token if it is available.
+
+The cached token is scoped to a device ID, so multiple devices can run the Citrix DaaS DataSources if needed.</technology>
+        <adlist><![CDATA[{"agdmethod":"none","agdparams":"","id":0,"filters":[],"params":{}}]]></adlist>
+        <schemaVersion>2</schemaVersion>
+        <dataSourceType>1</dataSourceType>
+        <attributes>
+        <attribute>
+            <name>scripttype</name>
+            <value>embed</value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>scriptgroovy</name>
+            <value>// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas
+
+import com.santaba.agent.util.script.ScriptCache
+import groovy.json.JsonSlurper
+import org.apache.http.client.utils.URIBuilder
+import org.apache.http.message.BasicNameValuePair
+
+// core http classes
+import org.apache.http.auth.AuthScope
+import org.apache.http.auth.Credentials
+import org.apache.http.auth.NTCredentials
+import org.apache.http.client.config.*
+import org.apache.http.client.entity.*
+import org.apache.http.client.methods.*
+import org.apache.http.client.ServiceUnavailableRetryStrategy
+import org.apache.http.conn.ssl.NoopHostnameVerifier
+import org.apache.http.conn.ssl.TrustSelfSignedStrategy
+import org.apache.http.entity.*
+import org.apache.http.Header
+import org.apache.http.HttpResponse
+import org.apache.http.impl.client.BasicCredentialsProvider
+import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.client.HttpClientBuilder
+import org.apache.http.impl.client.StandardHttpRequestRetryHandler
+import org.apache.http.ssl.SSLContextBuilder
+import org.apache.http.util.EntityUtils
+
+// LM properties
+def propDeviceId = hostProps.get(&#39;system.deviceId&#39;)
+def propSystemHost = hostProps.get(&#39;system.hostname&#39;)
+def propHost = hostProps.get(&#39;citrixdaas.host&#39;) ?: propSystemHost
+def propClientId = hostProps.get(&#39;citrixdaas.api.id&#39;)
+def propClientSecret = hostProps.get(&#39;citrixdaas.api.key&#39;)
+def propCustomerId = hostProps.get(&#39;citrixdaas.customerid&#39;)
+
+try
+{
+    def sessionToken = getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)
+
+    if (sessionToken == &#39;&#39;)
+    {
+        println &#39;Error: Invalid session token.&#39;
+        return 2
+    }
+    else
+    {
+        def cache = ScriptCache.getCache()
+        cache.set(&#34;CitrixDaasToken${propDeviceId}&#34;, sessionToken, 3600000)
+    }
+
+    return 0
+}
+catch (Exception e)
+{
+    println e
+    return 1
+}
+
+String getSessionToken(String host, String clientId, String clientSecret, String customerId)
+{
+    def sessionToken = &#39;&#39;
+
+    def postUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(host)
+        .setPath(&#34;/cctrustoauth2/${customerId}/tokens/clients&#34;)
+
+    def postData = []
+    postData.add(new BasicNameValuePair(&#39;grant_type&#39;, &#39;client_credentials&#39;))
+    postData.add(new BasicNameValuePair(&#39;client_id&#39;, clientId))
+    postData.add(new BasicNameValuePair(&#39;client_secret&#39;, clientSecret))
+    def postEntity = new UrlEncodedFormEntity(postData)
+
+    def httpPost = new HttpPost(postUriBuilder.build())
+    httpPost.setHeader(&#39;Accept&#39;, &#39;application/json&#39;)
+    httpPost.setHeader(&#39;Content-Type&#39;, &#39;application/x-www-form-urlencoded&#39;)
+
+    def postResponse = runRequest(httpPost, null, postEntity)
+
+    if (postResponse.code == 200)
+    {
+        def jsonSlurper = new JsonSlurper()
+        def jsonResponse = jsonSlurper.parseText(postResponse.body)
+        sessionToken = jsonResponse.access_token
+    }
+
+    return sessionToken
+}
+
+Map runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)
+{
+    if (request instanceof HttpGet != true)
+    {
+        request.setEntity(entity)
+    }
+
+    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion
+    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient
+    def waitPeriod = 0L
+    def serviceRetry = [
+        retryRequest: { response, executionCount, context -&#62;
+            // increase the wait for each try, here we would wait 3, 6 and 9 seconds
+            waitPeriod += 3000L
+            def statusCode = response.getStatusLine().getStatusCode()
+            return executionCount &#60;= 3 &#38;&#38; (statusCode == 429 || statusCode == 500 || statusCode == 503)
+        },
+        getRetryInterval: {
+            return waitPeriod
+        }
+    ] as ServiceUnavailableRetryStrategy
+
+    // create an http client which retries for connection &#34;I/O&#34; errors and for certain http status codes
+    HttpClientBuilder httpClientBuilder = HttpClients.custom()
+        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
+        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))
+        .setServiceUnavailableRetryStrategy(serviceRetry)
+
+    // allow self-signed certificates
+    httpClientBuilder.setSSLContext(
+        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()
+    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+
+    if (credentials)
+    {
+        // attempt authentication with credentials supported by the BasicCredentialsProvider
+        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()
+        credentialProvider.setCredentials(AuthScope.ANY, credentials)
+        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)
+    }
+
+    CloseableHttpClient httpClient = httpClientBuilder.build()
+    HttpResponse response = httpClient.execute(request)
+    String responseBody = null
+
+    if (response.getEntity())
+    {
+        // only attempt to convert the body to string if there is content
+        responseBody = EntityUtils.toString(response.getEntity())
+    }
+
+    Integer code = response.getStatusLine().getStatusCode()
+    List&#60;Header&#62; headers = response.getAllHeaders()
+
+    def responseMap = [
+        code: code,
+        headers: headers,
+        body: responseBody,
+    ]
+
+    httpClient.close()
+    return responseMap
+}</value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>windowsscript</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>linuxscript</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>windowscmdline</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>linuxcmdline</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>properties</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>manualConnections</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        </attributes>
+        <datapoints>
+        <datapoint>
+            <name>ExecutionTimeMS</name>
+            <originId>Mb_IVqSgRKCJ3hlvLPgj4g</originId>
+            <dataType>4</dataType>
+            <type>2</type>
+            <postprocessormethod>none</postprocessormethod>
+            <postprocessorparam></postprocessorparam>
+            <usevalue>responseTime</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Time taken to execute the script in milliseconds.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>ExitCode</name>
+            <originId>g_n49GYcSBu65CNYPZsaqA</originId>
+            <dataType>4</dataType>
+            <type>2</type>
+            <postprocessormethod>none</postprocessormethod>
+            <postprocessorparam></postprocessorparam>
+            <usevalue>exitCode</usevalue>
+            <alertexpr>!= 0 0</alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>##HOST## failed to generate a Citrix Cloud session token with a status of ##VALUE##, this could stop other DataSources using the token from collecting data.
+
+This started at ##START##, or ##DURATION## ago.
+
+Status codes:
+0=Success
+1=Script error
+2=Failed to get session token</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Script exit code.
+
+Status codes:
+0=Success
+1=Script error
+2=Failed to get session token</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>2</alertTransitionIval>
+            <alertClearTransitionIval>1</alertClearTransitionIval>
+        </datapoint>
+        </datapoints>
+        <graphs>
+        <graph>
+            <name>Execution Time</name>
+            <title>Execution Time</title>
+            <originId></originId>            <verticallabel>milliseconds</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>2</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>ExecutionTimeMS</name>
+            <datapointname>ExecutionTimeMS</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>1</type>
+                <legend>ExecutionTimeMS</legend>
+                <color>orange</color>
+                <datapointname>ExecutionTimeMS</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        <graph>
+            <name>Exit Code</name>
+            <title>Exit Code</title>
+            <originId></originId>            <verticallabel>status code</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>1</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>ExitCode</name>
+            <datapointname>ExitCode</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>1</type>
+                <legend>ExitCode</legend>
+                <color>blue</color>
+                <datapointname>ExitCode</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        </graphs>
+        <overviewgraphs>
+        </overviewgraphs>
+        <scripts>
+        </scripts>
+    </entry>
+</feed>

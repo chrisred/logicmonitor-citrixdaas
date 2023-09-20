@@ -1,0 +1,1238 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<feed  version="1.0" hasPendingRequests="false" >
+  <company></company>
+  <status>200</status>
+  <errmsg>OK</errmsg>
+  <interval>0</interval>
+    <entry type="predatasource">
+        <version>1695237111</version>
+        <name>CitrixDaaS_ApplicationUsage</name>
+        <displayedas>Citrix DaaS Application Usage</displayedas>
+        <description>Application usage metrics.</description>
+        <collector>batchscript</collector>
+        <hasMultiInstances>true</hasMultiInstances>
+        <useWildValueAsUniqueIdentifier>true</useWildValueAsUniqueIdentifier>
+        <schedule>300</schedule>
+        <appliesTo>hasCategory(&#34;CitrixDaaS&#34;)</appliesTo>
+        <wildcardauto>true</wildcardauto>
+        <wildcardpersist>false</wildcardpersist>
+        <wildcardlinuxscript>ad_script</wildcardlinuxscript>
+        <wildcardlinuxcmdline>type=&#34;embeded&#34; </wildcardlinuxcmdline>
+        <wildcardwinscript>ad_script</wildcardwinscript>
+        <wildcardwincmdline>type=&#34;embeded&#34; </wildcardwincmdline>
+        <wildcardgroovyscript>// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas
+
+import com.santaba.agent.util.script.ScriptCache
+import groovy.json.JsonSlurper
+import org.apache.http.client.utils.URIBuilder
+import org.apache.http.message.BasicNameValuePair
+
+// core http classes
+import org.apache.http.auth.AuthScope
+import org.apache.http.auth.Credentials
+import org.apache.http.auth.NTCredentials
+import org.apache.http.client.config.*
+import org.apache.http.client.entity.*
+import org.apache.http.client.methods.*
+import org.apache.http.client.ServiceUnavailableRetryStrategy
+import org.apache.http.conn.ssl.NoopHostnameVerifier
+import org.apache.http.conn.ssl.TrustSelfSignedStrategy
+import org.apache.http.entity.*
+import org.apache.http.Header
+import org.apache.http.HttpResponse
+import org.apache.http.impl.client.BasicCredentialsProvider
+import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.client.HttpClientBuilder
+import org.apache.http.impl.client.StandardHttpRequestRetryHandler
+import org.apache.http.ssl.SSLContextBuilder
+import org.apache.http.util.EntityUtils
+
+// LM properties
+def propDeviceId = hostProps.get(&#39;system.deviceId&#39;)
+def propSystemHost = hostProps.get(&#39;system.hostname&#39;)
+def propHost = hostProps.get(&#39;citrixdaas.host&#39;) ?: propSystemHost
+def propClientId = hostProps.get(&#39;citrixdaas.api.id&#39;)
+def propClientSecret = hostProps.get(&#39;citrixdaas.api.key&#39;)
+def propCustomerId = hostProps.get(&#39;citrixdaas.customerid&#39;)
+def propUser = hostProps.get(&#39;citrixdaas.user&#39;)
+def propPass = hostProps.get(&#39;citrixdaas.pass&#39;)
+def propScheme = hostProps.get(&#39;citrixdaas.usehttps&#39;) ? &#39;https&#39; : &#39;http&#39;
+
+def isCitrixCloud = propClientId &#38;&#38; propClientSecret &#38;&#38; propCustomerId
+def sessionToken = &#39;&#39;
+def ntCredentials = null
+
+def lifecycleStateMap = [
+    0: &#39;Active&#39;,
+    1: &#39;Deleted&#39;,
+    2: &#39;Requires Resolution&#39;,
+    3: &#39;Stub&#39;
+]
+
+def applicationTypeMap = [
+    0: &#39;Hosted On Desktop&#39;,
+    1: &#39;Installed On Client&#39;
+]
+
+try
+{
+    def mainUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(propHost)
+        .setPath(&#39;/monitorodata/Applications&#39;)
+
+    if (isCitrixCloud)
+    {
+        // get session token for Citrix Cloud API
+        sessionToken = getCachedToken(propDeviceId) ?:
+            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)
+
+        if (sessionToken == &#39;&#39;)
+        {
+            println &#39;Error: Invalid session token.&#39;
+            return 2
+        }
+    }
+    else
+    {
+        // modify request for an on-prem delivery controller
+        mainUriBuilder.setScheme(propScheme)
+        mainUriBuilder.setPath(&#39;/Citrix/Monitor/OData/v4/Data/Applications&#39;)
+
+        def credDomain = null
+        if (propUser &#38;&#38; propPass &#38;&#38; propUser.contains(&#39;\\&#39;))
+        {
+            credDomain = propUser.tokenize(&#39;\\&#39;)[0]
+            credUser = propUser.tokenize(&#39;\\&#39;)[1]
+        }
+        else
+        {
+            throw new Exception(
+                &#34;The &#39;citrixdass.user&#39; and &#39;pass&#39; properties are required, the user must be in the DOMAIN\\User format.&#34;
+            )
+        }
+
+        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)
+    }
+
+    def mainUri = mainUriBuilder.build()
+    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)
+
+    if (mainResponse.code == 429)
+    {
+        // rate limit response code
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 3
+    }
+    else if (mainResponse.code != 200)
+    {
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 4
+    }
+
+    mainResponse.json.value.each { application -&#62;
+        def wildValue = application.Id
+        def wildAlias = application.Name
+
+        def instanceProperties = [
+            &#39;citrixdaas.applicationtype&#39; : applicationTypeMap.getOrDefault(application.ApplicationType, -1),
+            &#39;citrixdaas.enabled&#39; : application.Enabled,
+            &#39;citrixdaas.lifecyclestate&#39; : lifecycleStateMap.getOrDefault(application.LifecycleState, -1)
+        ]
+
+        // Encode the instance property strings to escape any HTTP/URL special characters, the wild value/alias strings
+        // appear to be encoded by LogicMontor automatically.
+        instanceProperyStrings = instanceProperties.collect { property, value -&#62;
+            URLEncoder.encode(property, &#39;UTF-8&#39;) + &#39;=&#39; + URLEncoder.encode(value.toString(), &#39;UTF-8&#39;)
+        }
+
+        println &#34;${wildValue}##${wildAlias}######${instanceProperyStrings.join(&#39;&#38;&#39;)}&#34;
+    }
+
+    return 0
+}
+catch (Exception e)
+{
+    println e
+    return 1
+}
+
+String getCachedToken(String deviceId)
+{
+    def cache = ScriptCache.getCache()
+    def cacheValue = cache.get(&#34;CitrixDaasToken${deviceId}&#34;)
+
+    return cacheValue ?: &#39;&#39;
+}
+
+String getSessionToken(String host, String clientId, String clientSecret, String customerId)
+{
+    def sessionToken = &#39;&#39;
+
+    def postUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(host)
+        .setPath(&#34;/cctrustoauth2/${customerId}/tokens/clients&#34;)
+
+    def postData = []
+    postData.add(new BasicNameValuePair(&#39;grant_type&#39;, &#39;client_credentials&#39;))
+    postData.add(new BasicNameValuePair(&#39;client_id&#39;, clientId))
+    postData.add(new BasicNameValuePair(&#39;client_secret&#39;, clientSecret))
+    def postEntity = new UrlEncodedFormEntity(postData)
+
+    def httpPost = new HttpPost(postUriBuilder.build())
+    httpPost.setHeader(&#39;Accept&#39;, &#39;application/json&#39;)
+    httpPost.setHeader(&#39;Content-Type&#39;, &#39;application/x-www-form-urlencoded&#39;)
+
+    def postResponse = runRequest(httpPost, null, postEntity)
+
+    if (postResponse.code == 200)
+    {
+        def jsonSlurper = new JsonSlurper()
+        def jsonResponse = jsonSlurper.parseText(postResponse.body)
+        sessionToken = jsonResponse.access_token
+    }
+
+    return sessionToken
+}
+
+Map runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)
+{
+    def uriString = uri.toString()
+    def responseMap = [
+        code: null,
+        json: null
+    ]
+
+    while (true)
+    {
+        def httpGet = new HttpGet(uriString)
+
+        if (isCloud)
+        {
+            httpGet.addHeader(&#39;Authorization&#39; , &#34;CwsAuth Bearer=${token}&#34;)
+            httpGet.addHeader(&#39;Citrix-CustomerId&#39; , customerId)
+        }
+
+        def response = runRequest(httpGet, credentials)
+        def jsonSlurper = new JsonSlurper()
+        def json = jsonSlurper.parseText(response.body)
+
+        if (responseMap.code == null)
+        {
+            // a null value in responseMap means this is the first page
+            responseMap.code = response.code
+            responseMap.json = json
+        }
+        else
+        {
+            // for additional pages append the &#34;json.value&#34; list to the existing list
+            responseMap.code = response.code
+            responseMap.json.value.addAll(json.value)
+        }
+
+        if (responseMap.code != 200)
+        {
+            // response is bad, stop now and return as we dont have the full result set
+            return responseMap
+        }
+
+        if (json.get(&#39;@odata.nextLink&#39;) != null)
+        {
+            uriString = json[&#39;@odata.nextLink&#39;]
+        }
+        else
+        {
+            // no &#34;nextLink&#34; means all pages have been queried
+            return responseMap
+        }
+    }
+}
+
+Map runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)
+{
+    if (request instanceof HttpGet != true)
+    {
+        request.setEntity(entity)
+    }
+
+    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion
+    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient
+    def waitPeriod = 0L
+    def serviceRetry = [
+        retryRequest: { response, executionCount, context -&#62;
+            // increase the wait for each try, here we would wait 10, 20 and 30 seconds
+            waitPeriod += 10000L
+            def statusCode = response.getStatusLine().getStatusCode()
+            return executionCount &#60;= 3 &#38;&#38; (statusCode == 429 || statusCode == 500 || statusCode == 503)
+        },
+        getRetryInterval: {
+            return waitPeriod
+        }
+    ] as ServiceUnavailableRetryStrategy
+
+    // create an http client which retries for connection &#34;I/O&#34; errors and for certain http status codes
+    HttpClientBuilder httpClientBuilder = HttpClients.custom()
+        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
+        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))
+        .setServiceUnavailableRetryStrategy(serviceRetry)
+
+    // allow self-signed certificates
+    httpClientBuilder.setSSLContext(
+        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()
+    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+
+    if (credentials)
+    {
+        // attempt authentication with credentials supported by the BasicCredentialsProvider
+        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()
+        credentialProvider.setCredentials(AuthScope.ANY, credentials)
+        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)
+    }
+
+    CloseableHttpClient httpClient = httpClientBuilder.build()
+    HttpResponse response = httpClient.execute(request)
+    String responseBody = null
+
+    if (response.getEntity())
+    {
+        // only attempt to convert the body to string if there is content
+        responseBody = EntityUtils.toString(response.getEntity())
+    }
+
+    Integer code = response.getStatusLine().getStatusCode()
+    List&#60;Header&#62; headers = response.getAllHeaders()
+
+    def responseMap = [
+        code: code,
+        headers: headers,
+        body: responseBody,
+    ]
+
+    httpClient.close()
+    return responseMap
+}
+</wildcardgroovyscript>
+        <wildcardschedule>1440</wildcardschedule>
+        <wildcarddisable>false</wildcarddisable>
+        <wildcarddeleteinactive>false</wildcarddeleteinactive>
+        <agdmethod>none</agdmethod>
+        <agdparams></agdparams>
+        <group></group>
+        <tags></tags>
+        <technology>Device Properties:
+
+– Citrix Cloud
+citrixdaas.api.id – Citrix Cloud API Client ID.
+citrixdaas.api.key – Citrix Cloud API Client Secret.
+citrixdaas.customerid – Citrix Cloud Customer ID.
+
+– On-prem
+citrixdaas.user – The user name in the NetBIOS DOMAIN\User form.
+citrixdaas.pass – The user password.
+citrixdaas.usehttps – Optional, connect to the Delivery Controller using HTTPS.
+
+– Both
+system.categories – Add &#34;CitrixDaaS&#34;.
+citrixdaas.host – Optional, defaults to the device IP when not set.
+
+Notes:
+
+For Citrix Cloud see the &#34;CitrixDaaS_Token&#34; DataSource for details on creating API credentials.
+
+For On-prem add the &#34;CitrixDaaS&#34; category and the user/pass properties to the device monitoring a Delivery Controller (DDC). The user account requires the Read Only Administrator role.</technology>
+        <adlist><![CDATA[{"agdmethod":"none","method":"ad_script","agdparams":"","id":0,"filters":[],"params":{"type":"embeded","groovyscript":"// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas\n\nimport com.santaba.agent.util.script.ScriptCache\nimport groovy.json.JsonSlurper\nimport org.apache.http.client.utils.URIBuilder\nimport org.apache.http.message.BasicNameValuePair\n\n// core http classes\nimport org.apache.http.auth.AuthScope\nimport org.apache.http.auth.Credentials\nimport org.apache.http.auth.NTCredentials\nimport org.apache.http.client.config.*\nimport org.apache.http.client.entity.*\nimport org.apache.http.client.methods.*\nimport org.apache.http.client.ServiceUnavailableRetryStrategy\nimport org.apache.http.conn.ssl.NoopHostnameVerifier\nimport org.apache.http.conn.ssl.TrustSelfSignedStrategy\nimport org.apache.http.entity.*\nimport org.apache.http.Header\nimport org.apache.http.HttpResponse\nimport org.apache.http.impl.client.BasicCredentialsProvider\nimport org.apache.http.impl.client.CloseableHttpClient\nimport org.apache.http.impl.client.HttpClients\nimport org.apache.http.impl.client.HttpClientBuilder\nimport org.apache.http.impl.client.StandardHttpRequestRetryHandler\nimport org.apache.http.ssl.SSLContextBuilder\nimport org.apache.http.util.EntityUtils\n\n// LM properties\ndef propDeviceId = hostProps.get('system.deviceId')\ndef propSystemHost = hostProps.get('system.hostname')\ndef propHost = hostProps.get('citrixdaas.host') ?: propSystemHost\ndef propClientId = hostProps.get('citrixdaas.api.id')\ndef propClientSecret = hostProps.get('citrixdaas.api.key')\ndef propCustomerId = hostProps.get('citrixdaas.customerid')\ndef propUser = hostProps.get('citrixdaas.user')\ndef propPass = hostProps.get('citrixdaas.pass')\ndef propScheme = hostProps.get('citrixdaas.usehttps') ? 'https' : 'http'\n\ndef isCitrixCloud = propClientId && propClientSecret && propCustomerId\ndef sessionToken = ''\ndef ntCredentials = null\n\ndef lifecycleStateMap = [\n    0: 'Active',\n    1: 'Deleted',\n    2: 'Requires Resolution',\n    3: 'Stub'\n]\n\ndef applicationTypeMap = [\n    0: 'Hosted On Desktop',\n    1: 'Installed On Client'\n]\n\ntry\n{\n    def mainUriBuilder = new URIBuilder()\n        .setScheme('https')\n        .setHost(propHost)\n        .setPath('/monitorodata/Applications')\n\n    if (isCitrixCloud)\n    {\n        // get session token for Citrix Cloud API\n        sessionToken = getCachedToken(propDeviceId) ?:\n            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)\n\n        if (sessionToken == '')\n        {\n            println 'Error: Invalid session token.'\n            return 2\n        }\n    }\n    else\n    {\n        // modify request for an on-prem delivery controller\n        mainUriBuilder.setScheme(propScheme)\n        mainUriBuilder.setPath('/Citrix/Monitor/OData/v4/Data/Applications')\n\n        def credDomain = null\n        if (propUser && propPass && propUser.contains('\\\\'))\n        {\n            credDomain = propUser.tokenize('\\\\')[0]\n            credUser = propUser.tokenize('\\\\')[1]\n        }\n        else\n        {\n            throw new Exception(\n                \"The 'citrixdass.user' and 'pass' properties are required, the user must be in the DOMAIN\\\\User format.\"\n            )\n        }\n\n        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)\n    }\n\n    def mainUri = mainUriBuilder.build()\n    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)\n\n    if (mainResponse.code == 429)\n    {\n        // rate limit response code\n        println \"Error: Bad response code (${mainResponse.code}).\"\n        return 3\n    }\n    else if (mainResponse.code != 200)\n    {\n        println \"Error: Bad response code (${mainResponse.code}).\"\n        return 4\n    }\n\n    mainResponse.json.value.each { application ->\n        def wildValue = application.Id\n        def wildAlias = application.Name\n\n        def instanceProperties = [\n            'citrixdaas.applicationtype' : applicationTypeMap.getOrDefault(application.ApplicationType, -1),\n            'citrixdaas.enabled' : application.Enabled,\n            'citrixdaas.lifecyclestate' : lifecycleStateMap.getOrDefault(application.LifecycleState, -1)\n        ]\n\n        // Encode the instance property strings to escape any HTTP/URL special characters, the wild value/alias strings\n        // appear to be encoded by LogicMontor automatically.\n        instanceProperyStrings = instanceProperties.collect { property, value ->\n            URLEncoder.encode(property, 'UTF-8') + '=' + URLEncoder.encode(value.toString(), 'UTF-8')\n        }\n\n        println \"${wildValue}##${wildAlias}######${instanceProperyStrings.join('&')}\"\n    }\n\n    return 0\n}\ncatch (Exception e)\n{\n    println e\n    return 1\n}\n\nString getCachedToken(String deviceId)\n{\n    def cache = ScriptCache.getCache()\n    def cacheValue = cache.get(\"CitrixDaasToken${deviceId}\")\n\n    return cacheValue ?: ''\n}\n\nString getSessionToken(String host, String clientId, String clientSecret, String customerId)\n{\n    def sessionToken = ''\n\n    def postUriBuilder = new URIBuilder()\n        .setScheme('https')\n        .setHost(host)\n        .setPath(\"/cctrustoauth2/${customerId}/tokens/clients\")\n\n    def postData = []\n    postData.add(new BasicNameValuePair('grant_type', 'client_credentials'))\n    postData.add(new BasicNameValuePair('client_id', clientId))\n    postData.add(new BasicNameValuePair('client_secret', clientSecret))\n    def postEntity = new UrlEncodedFormEntity(postData)\n\n    def httpPost = new HttpPost(postUriBuilder.build())\n    httpPost.setHeader('Accept', 'application/json')\n    httpPost.setHeader('Content-Type', 'application/x-www-form-urlencoded')\n\n    def postResponse = runRequest(httpPost, null, postEntity)\n\n    if (postResponse.code == 200)\n    {\n        def jsonSlurper = new JsonSlurper()\n        def jsonResponse = jsonSlurper.parseText(postResponse.body)\n        sessionToken = jsonResponse.access_token\n    }\n\n    return sessionToken\n}\n\nMap runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)\n{\n    def uriString = uri.toString()\n    def responseMap = [\n        code: null,\n        json: null\n    ]\n\n    while (true)\n    {\n        def httpGet = new HttpGet(uriString)\n\n        if (isCloud)\n        {\n            httpGet.addHeader('Authorization' , \"CwsAuth Bearer=${token}\")\n            httpGet.addHeader('Citrix-CustomerId' , customerId)\n        }\n\n        def response = runRequest(httpGet, credentials)\n        def jsonSlurper = new JsonSlurper()\n        def json = jsonSlurper.parseText(response.body)\n\n        if (responseMap.code == null)\n        {\n            // a null value in responseMap means this is the first page\n            responseMap.code = response.code\n            responseMap.json = json\n        }\n        else\n        {\n            // for additional pages append the \"json.value\" list to the existing list\n            responseMap.code = response.code\n            responseMap.json.value.addAll(json.value)\n        }\n\n        if (responseMap.code != 200)\n        {\n            // response is bad, stop now and return as we dont have the full result set\n            return responseMap\n        }\n\n        if (json.get('@odata.nextLink') != null)\n        {\n            uriString = json['@odata.nextLink']\n        }\n        else\n        {\n            // no \"nextLink\" means all pages have been queried\n            return responseMap\n        }\n    }\n}\n\nMap runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)\n{\n    if (request instanceof HttpGet != true)\n    {\n        request.setEntity(entity)\n    }\n\n    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion\n    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient\n    def waitPeriod = 0L\n    def serviceRetry = [\n        retryRequest: { response, executionCount, context ->\n            // increase the wait for each try, here we would wait 10, 20 and 30 seconds\n            waitPeriod += 10000L\n            def statusCode = response.getStatusLine().getStatusCode()\n            return executionCount <= 3 && (statusCode == 429 || statusCode == 500 || statusCode == 503)\n        },\n        getRetryInterval: {\n            return waitPeriod\n        }\n    ] as ServiceUnavailableRetryStrategy\n\n    // create an http client which retries for connection \"I/O\" errors and for certain http status codes\n    HttpClientBuilder httpClientBuilder = HttpClients.custom()\n        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())\n        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))\n        .setServiceUnavailableRetryStrategy(serviceRetry)\n\n    // allow self-signed certificates\n    httpClientBuilder.setSSLContext(\n        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()\n    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)\n\n    if (credentials)\n    {\n        // attempt authentication with credentials supported by the BasicCredentialsProvider\n        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()\n        credentialProvider.setCredentials(AuthScope.ANY, credentials)\n        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)\n    }\n\n    CloseableHttpClient httpClient = httpClientBuilder.build()\n    HttpResponse response = httpClient.execute(request)\n    String responseBody = null\n\n    if (response.getEntity())\n    {\n        // only attempt to convert the body to string if there is content\n        responseBody = EntityUtils.toString(response.getEntity())\n    }\n\n    Integer code = response.getStatusLine().getStatusCode()\n    List<Header> headers = response.getAllHeaders()\n\n    def responseMap = [\n        code: code,\n        headers: headers,\n        body: responseBody,\n    ]\n\n    httpClient.close()\n    return responseMap\n}\n"}}]]></adlist>
+        <schemaVersion>2</schemaVersion>
+        <dataSourceType>1</dataSourceType>
+        <attributes>
+        <attribute>
+            <name>scripttype</name>
+            <value>embed</value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>scriptgroovy</name>
+            <value>// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas
+
+import com.santaba.agent.util.script.ScriptCache
+import groovy.json.JsonSlurper
+import org.apache.http.client.utils.URIBuilder
+import org.apache.http.message.BasicNameValuePair
+
+// core http classes
+import org.apache.http.auth.AuthScope
+import org.apache.http.auth.Credentials
+import org.apache.http.auth.NTCredentials
+import org.apache.http.client.config.*
+import org.apache.http.client.entity.*
+import org.apache.http.client.methods.*
+import org.apache.http.client.ServiceUnavailableRetryStrategy
+import org.apache.http.conn.ssl.NoopHostnameVerifier
+import org.apache.http.conn.ssl.TrustSelfSignedStrategy
+import org.apache.http.entity.*
+import org.apache.http.Header
+import org.apache.http.HttpResponse
+import org.apache.http.impl.client.BasicCredentialsProvider
+import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.client.HttpClientBuilder
+import org.apache.http.impl.client.StandardHttpRequestRetryHandler
+import org.apache.http.ssl.SSLContextBuilder
+import org.apache.http.util.EntityUtils
+
+// LM properties
+def propDeviceId = hostProps.get(&#39;system.deviceId&#39;)
+def propSystemHost = hostProps.get(&#39;system.hostname&#39;)
+def propHost = hostProps.get(&#39;citrixdaas.host&#39;) ?: propSystemHost
+def propClientId = hostProps.get(&#39;citrixdaas.api.id&#39;)
+def propClientSecret = hostProps.get(&#39;citrixdaas.api.key&#39;)
+def propCustomerId = hostProps.get(&#39;citrixdaas.customerid&#39;)
+def propUser = hostProps.get(&#39;citrixdaas.user&#39;)
+def propPass = hostProps.get(&#39;citrixdaas.pass&#39;)
+def propScheme = hostProps.get(&#39;citrixdaas.usehttps&#39;) ? &#39;https&#39; : &#39;http&#39;
+
+def isCitrixCloud = propClientId &#38;&#38; propClientSecret &#38;&#38; propCustomerId
+def sessionToken = &#39;&#39;
+def ntCredentials = null
+
+def connectionStateMap = [
+    0: &#39;Unknown&#39;,
+    1: &#39;Connected&#39;,
+    2: &#39;Disconnected&#39;,
+    3: &#39;Terminated&#39;,
+    4: &#39;PreparingSession&#39;,
+    5: &#39;Active&#39;,
+    6: &#39;Reconnecting&#39;,
+    7: &#39;NonBrokeredSession&#39;,
+    8: &#39;Other&#39;,
+    9: &#39;Pending&#39;
+]
+
+try
+{
+    def mainUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(propHost)
+        .setPath(&#39;/monitorodata/Applications&#39;)
+        .setParameter(&#39;$select&#39;, &#39;Id&#39;)
+        .setParameter(
+            &#39;$expand&#39;,
+            &#39;ApplicationInstances($select=Session;$expand=Session($select=StartDate,EndDate,ConnectionState;&#39; + 
+            &#39;$filter=EndDate eq null))&#39;
+        )
+
+    if (isCitrixCloud)
+    {
+        // get session token for Citrix Cloud API
+        sessionToken = getCachedToken(propDeviceId) ?:
+            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)
+
+        if (sessionToken == &#39;&#39;)
+        {
+            println &#39;Error: Invalid session token.&#39;
+            return 2
+        }
+    }
+    else
+    {
+        // modify request for an on-prem delivery controller
+        mainUriBuilder.setScheme(propScheme)
+        mainUriBuilder.setPath(&#39;/Citrix/Monitor/OData/v4/Data/Applications&#39;)
+
+        def credDomain = null
+        if (propUser &#38;&#38; propPass &#38;&#38; propUser.contains(&#39;\\&#39;))
+        {
+            credDomain = propUser.tokenize(&#39;\\&#39;)[0]
+            credUser = propUser.tokenize(&#39;\\&#39;)[1]
+        }
+        else
+        {
+            throw new Exception(
+                &#34;The &#39;citrixdass.user&#39; and &#39;pass&#39; properties are required, the user must be in the DOMAIN\\User format.&#34;
+            )
+        }
+
+        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)
+    }
+
+    def mainUri = mainUriBuilder.build()
+    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)
+
+    if (mainResponse.code == 429)
+    {
+        // rate limit response code
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 3
+    }
+    else if (mainResponse.code != 200)
+    {
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 4
+    }
+
+    mainResponse.json.value.each { application -&#62;
+        def wildValue = application.Id
+
+        def instancesCount = 0
+        def instanceStateCount = connectionStateMap.collectEntries {[it.key, 0]}
+
+        application.ApplicationInstances.each { instance -&#62;
+            instancesCount++
+            instanceStateCount[instance.Session.ConnectionState]++
+        }
+
+        instanceStateCount.each { key, value -&#62;
+            output(&#34;Instances${connectionStateMap[key]}&#34;, value, wildValue)
+        }
+
+        output(&#39;TotalInstances&#39;, instancesCount, wildValue)
+    }
+
+    return 0
+}
+catch (Exception e)
+{
+    println e
+    return 1
+}
+
+String getCachedToken(String deviceId)
+{
+    def cache = ScriptCache.getCache()
+    def cacheValue = cache.get(&#34;CitrixDaasToken${deviceId}&#34;)
+
+    return cacheValue ?: &#39;&#39;
+}
+
+String getSessionToken(String host, String clientId, String clientSecret, String customerId)
+{
+    def sessionToken = &#39;&#39;
+
+    def postUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(host)
+        .setPath(&#34;/cctrustoauth2/${customerId}/tokens/clients&#34;)
+
+    def postData = []
+    postData.add(new BasicNameValuePair(&#39;grant_type&#39;, &#39;client_credentials&#39;))
+    postData.add(new BasicNameValuePair(&#39;client_id&#39;, clientId))
+    postData.add(new BasicNameValuePair(&#39;client_secret&#39;, clientSecret))
+    def postEntity = new UrlEncodedFormEntity(postData)
+
+    def httpPost = new HttpPost(postUriBuilder.build())
+    httpPost.setHeader(&#39;Accept&#39;, &#39;application/json&#39;)
+    httpPost.setHeader(&#39;Content-Type&#39;, &#39;application/x-www-form-urlencoded&#39;)
+
+    def postResponse = runRequest(httpPost, null, postEntity)
+
+    if (postResponse.code == 200)
+    {
+        def jsonSlurper = new JsonSlurper()
+        def jsonResponse = jsonSlurper.parseText(postResponse.body)
+        sessionToken = jsonResponse.access_token
+    }
+
+    return sessionToken
+}
+
+Map runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)
+{
+    def uriString = uri.toString()
+    def responseMap = [
+        code: null,
+        json: null
+    ]
+
+    while (true)
+    {
+        def httpGet = new HttpGet(uriString)
+
+        if (isCloud)
+        {
+            httpGet.addHeader(&#39;Authorization&#39; , &#34;CwsAuth Bearer=${token}&#34;)
+            httpGet.addHeader(&#39;Citrix-CustomerId&#39; , customerId)
+        }
+
+        def response = runRequest(httpGet, credentials)
+        def jsonSlurper = new JsonSlurper()
+        def json = jsonSlurper.parseText(response.body)
+
+        if (responseMap.code == null)
+        {
+            // a null value in responseMap means this is the first page
+            responseMap.code = response.code
+            responseMap.json = json
+        }
+        else
+        {
+            // for additional pages append the &#34;json.value&#34; list to the existing list
+            responseMap.code = response.code
+            responseMap.json.value.addAll(json.value)
+        }
+
+        if (responseMap.code != 200)
+        {
+            // response is bad, stop now and return as we dont have the full result set
+            return responseMap
+        }
+
+        if (json.get(&#39;@odata.nextLink&#39;) != null)
+        {
+            uriString = json[&#39;@odata.nextLink&#39;]
+        }
+        else
+        {
+            // no &#34;nextLink&#34; means all pages have been queried
+            return responseMap
+        }
+    }
+}
+
+Map runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)
+{
+    if (request instanceof HttpGet != true)
+    {
+        request.setEntity(entity)
+    }
+
+    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion
+    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient
+    def waitPeriod = 0L
+    def serviceRetry = [
+        retryRequest: { response, executionCount, context -&#62;
+            // increase the wait for each try, here we would wait 10, 20 and 30 seconds
+            waitPeriod += 10000L
+            def statusCode = response.getStatusLine().getStatusCode()
+            return executionCount &#60;= 3 &#38;&#38; (statusCode == 429 || statusCode == 500 || statusCode == 503)
+        },
+        getRetryInterval: {
+            return waitPeriod
+        }
+    ] as ServiceUnavailableRetryStrategy
+
+    // create an http client which retries for connection &#34;I/O&#34; errors and for certain http status codes
+    HttpClientBuilder httpClientBuilder = HttpClients.custom()
+        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
+        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))
+        .setServiceUnavailableRetryStrategy(serviceRetry)
+
+    // allow self-signed certificates
+    httpClientBuilder.setSSLContext(
+        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()
+    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+
+    if (credentials)
+    {
+        // attempt authentication with credentials supported by the BasicCredentialsProvider
+        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()
+        credentialProvider.setCredentials(AuthScope.ANY, credentials)
+        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)
+    }
+
+    CloseableHttpClient httpClient = httpClientBuilder.build()
+    HttpResponse response = httpClient.execute(request)
+    String responseBody = null
+
+    if (response.getEntity())
+    {
+        // only attempt to convert the body to string if there is content
+        responseBody = EntityUtils.toString(response.getEntity())
+    }
+
+    Integer code = response.getStatusLine().getStatusCode()
+    List&#60;Header&#62; headers = response.getAllHeaders()
+
+    def responseMap = [
+        code: code,
+        headers: headers,
+        body: responseBody,
+    ]
+
+    httpClient.close()
+    return responseMap
+}
+
+void output(key, value, instanceId=null)
+{
+    if (value instanceof BigDecimal)
+    {
+        // make sure BigDecimal does not render to string with Scientific Notation
+        value = value.toPlainString()
+    }
+
+    if (value instanceof Boolean)
+    {
+        value = value ? 1:0
+    }
+
+    if (instanceId)
+    {
+        println &#34;${instanceId}.${key}=${value}&#34;
+    }
+    else
+    {
+        println &#34;${key}=${value}&#34;
+    }
+}</value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>windowsscript</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>linuxscript</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>windowscmdline</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>linuxcmdline</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        </attributes>
+        <datapoints>
+        <datapoint>
+            <name>ExitCode</name>
+            <originId>CdyQcPOLQiyKSO6_17xs4A</originId>
+            <dataType>4</dataType>
+            <type>2</type>
+            <postprocessormethod>none</postprocessormethod>
+            <postprocessorparam></postprocessorparam>
+            <usevalue>exitCode</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description></description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesActive</name>
+            <originId>Ttk_9qBkS3ubBBHlc7nzcA</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesActive</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances with an active session.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesConnected</name>
+            <originId>j3yNiBHkRmKEq4vpq74Byw</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesConnected</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances actively connected to a desktop.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesDisconnected</name>
+            <originId>K8cXv5C-TraF8iaYekYUBA</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesDisconnected</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances disconnected from a desktop, but the session still exists.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesNonBrokeredSession</name>
+            <originId>8i7ZU4-9TlaaLfOVsluxRg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesNonBrokeredSession</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances with a non-brokered session.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesOther</name>
+            <originId>47Tsj9N5TgubrJ_pdDetqQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesOther</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances with an Other connection state.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesPending</name>
+            <originId>84KLWXovScG-rlnvwuIjVw</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesPending</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances with a Pending connection state.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesPreparingSession</name>
+            <originId>Wm2Etj3XSUOCv2NOms8k3A</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesPreparingSession</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances where the session is in the preparing state.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesReconnecting</name>
+            <originId>FXzFX60gRcuVJIWXVQhjZQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesReconnecting</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances where the user is reconnecting to the session.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesTerminated</name>
+            <originId>1gJHvVEFS8GgDcOkXGYzTQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesTerminated</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances where the session has been terminated.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>InstancesUnknown</name>
+            <originId>uqOaWgWQSFCWfPLnB3ZmQg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.InstancesUnknown</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Instances where the connection state is unknown.</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>TotalInstances</name>
+            <originId>wY1IwnWoQz-6wctgPdzsOQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.TotalInstances</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Total number of application instances .</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        </datapoints>
+        <graphs>
+        <graph>
+            <name>Instances</name>
+            <title>Instances</title>
+            <originId></originId>            <verticallabel>count</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>1</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>InstancesActive</name>
+            <datapointname>InstancesActive</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesConnected</name>
+            <datapointname>InstancesConnected</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesDisconnected</name>
+            <datapointname>InstancesDisconnected</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesNonBrokeredSession</name>
+            <datapointname>InstancesNonBrokeredSession</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesOther</name>
+            <datapointname>InstancesOther</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesPending</name>
+            <datapointname>InstancesPending</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesPreparingSession</name>
+            <datapointname>InstancesPreparingSession</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesReconnecting</name>
+            <datapointname>InstancesReconnecting</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesTerminated</name>
+            <datapointname>InstancesTerminated</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>InstancesUnknown</name>
+            <datapointname>InstancesUnknown</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>3</type>
+                <legend>Active</legend>
+                <color>blue</color>
+                <datapointname>InstancesActive</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>Connected</legend>
+                <color>green</color>
+                <datapointname>InstancesConnected</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>Disconnected</legend>
+                <color>red1</color>
+                <datapointname>InstancesDisconnected</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>Non-Brokered Session</legend>
+                <color>orange</color>
+                <datapointname>InstancesNonBrokeredSession</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>Other</legend>
+                <color>yellow</color>
+                <datapointname>InstancesOther</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>Pending</legend>
+                <color>maroon</color>
+                <datapointname>InstancesPending</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>1</type>
+                <legend>Preparing Session</legend>
+                <color>aqua</color>
+                <datapointname>InstancesPreparingSession</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>Reconnecting</legend>
+                <color>lime</color>
+                <datapointname>InstancesReconnecting</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>3</type>
+                <legend>Terminated</legend>
+                <color>red</color>
+                <datapointname>InstancesTerminated</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>1</type>
+                <legend>Unknown</legend>
+                <color>fuchsia</color>
+                <datapointname>InstancesUnknown</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        </graphs>
+        <overviewgraphs>
+        <overviewgraph>
+            <name>Instances</name>
+            <title>Instances</title>
+            <verticallabel>count</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>1</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <aggregated>false</aggregated>
+            <originId></originId>
+            <datapoints>
+        <overviewgraphdatapoint>
+            <name>TotalInstances</name>
+            <datapointname>TotalInstances</datapointname>
+            <cf>1</cf>
+            <aggregateMethod>sum</aggregateMethod>
+            <originId></originId>
+        </overviewgraphdatapoint>
+            </datapoints>
+            <virtualdatapoints>
+            </virtualdatapoints>
+            <lines>
+            <overviewgraphline>
+                <type>3</type>
+                <legend>##INSTANCE##</legend>
+                <datapointname>TotalInstances</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+                <color>silver</color>
+            </overviewgraphline>
+            </lines>
+        </overviewgraph>
+        </overviewgraphs>
+        <scripts>
+        </scripts>
+    </entry>
+</feed>

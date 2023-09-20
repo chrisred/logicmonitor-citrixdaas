@@ -1,0 +1,1944 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<feed  version="1.0" hasPendingRequests="false" >
+  <company></company>
+  <status>200</status>
+  <errmsg>OK</errmsg>
+  <interval>0</interval>
+    <entry type="predatasource">
+        <version>1695237130</version>
+        <name>CitrixDaaS_Machines</name>
+        <displayedas>Citrix DaaS Machines</displayedas>
+        <description>Machine status and metrics.</description>
+        <collector>batchscript</collector>
+        <hasMultiInstances>true</hasMultiInstances>
+        <useWildValueAsUniqueIdentifier>true</useWildValueAsUniqueIdentifier>
+        <schedule>300</schedule>
+        <appliesTo>hasCategory(&#34;CitrixDaaS&#34;)</appliesTo>
+        <wildcardauto>true</wildcardauto>
+        <wildcardpersist>false</wildcardpersist>
+        <wildcardlinuxscript>ad_script</wildcardlinuxscript>
+        <wildcardlinuxcmdline>type=&#34;embeded&#34; </wildcardlinuxcmdline>
+        <wildcardwinscript>ad_script</wildcardwinscript>
+        <wildcardwincmdline>type=&#34;embeded&#34; </wildcardwincmdline>
+        <wildcardgroovyscript>// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas
+
+import com.santaba.agent.util.script.ScriptCache
+import groovy.json.JsonSlurper
+import org.apache.http.client.utils.URIBuilder
+import org.apache.http.message.BasicNameValuePair
+
+// core http classes
+import org.apache.http.auth.AuthScope
+import org.apache.http.auth.Credentials
+import org.apache.http.auth.NTCredentials
+import org.apache.http.client.config.*
+import org.apache.http.client.entity.*
+import org.apache.http.client.methods.*
+import org.apache.http.client.ServiceUnavailableRetryStrategy
+import org.apache.http.conn.ssl.NoopHostnameVerifier
+import org.apache.http.conn.ssl.TrustSelfSignedStrategy
+import org.apache.http.entity.*
+import org.apache.http.Header
+import org.apache.http.HttpResponse
+import org.apache.http.impl.client.BasicCredentialsProvider
+import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.client.HttpClientBuilder
+import org.apache.http.impl.client.StandardHttpRequestRetryHandler
+import org.apache.http.ssl.SSLContextBuilder
+import org.apache.http.util.EntityUtils
+
+// LM properties
+def propDeviceId = hostProps.get(&#39;system.deviceId&#39;)
+def propSystemHost = hostProps.get(&#39;system.hostname&#39;)
+def propHost = hostProps.get(&#39;citrixdaas.host&#39;) ?: propSystemHost
+def propClientId = hostProps.get(&#39;citrixdaas.api.id&#39;)
+def propClientSecret = hostProps.get(&#39;citrixdaas.api.key&#39;)
+def propCustomerId = hostProps.get(&#39;citrixdaas.customerid&#39;)
+def propUser = hostProps.get(&#39;citrixdaas.user&#39;)
+def propPass = hostProps.get(&#39;citrixdaas.pass&#39;)
+def propScheme = hostProps.get(&#39;citrixdaas.usehttps&#39;) ? &#39;https&#39; : &#39;http&#39;
+
+def isCitrixCloud = propClientId &#38;&#38; propClientSecret &#38;&#38; propCustomerId
+def sessionToken = &#39;&#39;
+def ntCredentials = null
+
+def lifecycleStateMap = [
+    0: &#39;Active&#39;,
+    1: &#39;Deleted&#39;,
+    2: &#39;Requires Resolution&#39;,
+    3: &#39;Stub&#39;
+]
+
+def machineRoleMap = [
+    0: &#39;VDA&#39;,
+    1: &#39;DDC&#39;,
+    2: &#39;Both&#39;
+]
+
+def machineFunctionalLevelMap = [
+    0: &#39;L5 (VDA 5.6 FP1)&#39;,
+    1: &#39;L7 (VDA 7.0)&#39;,
+    2: &#39;L7_6 (VDA 7.6)&#39;,
+    3: &#39;L7_7 (VDA 7.7)&#39;,
+    4: &#39;L7_8 (VDA 7.8)&#39;,
+    5: &#39;L7_9 (VDA 7.9)&#39;,
+    6: &#39;L7_20 (VDA 1811)&#39;,
+    7: &#39;L7_25 (VDA 2003)&#39;,
+    8: &#39;L7_30 (VDA 2106)&#39;,
+    9: &#39;L7_34 (VDA 2206)&#39;,
+    10: &#39;L7_?? (VDA 2305)&#39;
+]
+
+try
+{
+    def mainUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(propHost)
+        .setPath(&#39;/monitorodata/Machines&#39;)
+        .setParameter(
+            &#39;$select&#39;,
+            &#39;Id,DnsName,LifecycleState,IPAddress,HostingServerName,HostedMachineName,FunctionalLevel,MachineRole&#39;
+        )
+        .setParameter(&#39;$expand&#39;, &#39;DesktopGroup($select=Id,Name)&#39;)
+        .setParameter(&#39;$filter&#39;, &#39;Name ne null and DesktopGroup ne null&#39;)
+
+    if (isCitrixCloud)
+    {
+        // get session token for Citrix Cloud API
+        sessionToken = getCachedToken(propDeviceId) ?:
+            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)
+
+        if (sessionToken == &#39;&#39;)
+        {
+            println &#39;Error: Invalid session token).&#39;
+            return 2
+        }
+    }
+    else
+    {
+        // modify request for an on-prem delivery controller
+        mainUriBuilder.setScheme(propScheme)
+        mainUriBuilder.setPath(&#39;/Citrix/Monitor/OData/v4/Data/Machines&#39;)
+
+        def credDomain = null
+        if (propUser.contains(&#39;\\&#39;))
+        {
+            credDomain = propUser.tokenize(&#39;\\&#39;)[0]
+            credUser = propUser.tokenize(&#39;\\&#39;)[1]
+        }
+        else
+        {
+            throw new Exception(&#34;The &#39;citrixdaas.user&#39; property must be in the DOMAIN\\User format.&#34;)
+        }
+
+        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)
+    }
+
+    def mainUri = mainUriBuilder.build()
+    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)
+
+    if (mainResponse.code == 429)
+    {
+        // rate limit response code
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 3
+    }
+    else if (mainResponse.code != 200)
+    {
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 4
+    }
+
+    mainResponse.json.value.each { machine -&#62;
+        def wildValue = machine.Id
+        // in some environments the HostedMachineName is not populated, so fall back to the DnsName
+        def wildAlias = machine.HostedMachineName ?: machine.DnsName
+
+        def instanceProperties = [
+            &#39;citrixdaas.desktopgroup&#39; : machine.DesktopGroup.Name,
+            &#39;citrixdaas.functionallevel&#39; : machineFunctionalLevelMap.getOrDefault(machine.FunctionalLevel, -1),
+            &#39;citrixdaas.hostingservername&#39; : machine.HostingServerName,
+            &#39;citrixdaas.ipaddress&#39; : machine.IPAddress,
+            &#39;citrixdaas.lifecyclestate&#39; : lifecycleStateMap.getOrDefault(machine.LifecycleState, -1),
+            &#39;citrixdaas.role&#39; : machineRoleMap.getOrDefault(machine.MachineRole, -1)
+        ]
+
+        // Encode the instance property strings to escape any HTTP/URL special characters, the wild value/alias strings
+        // appear to be encoded by LogicMontor automatically.
+        instanceProperyStrings = instanceProperties.collect { property, value -&#62;
+            URLEncoder.encode(property, &#39;UTF-8&#39;) + &#39;=&#39; + URLEncoder.encode(value.toString(), &#39;UTF-8&#39;)
+        }
+
+        println &#34;${wildValue}##${wildAlias}######${instanceProperyStrings.join(&#39;&#38;&#39;)}&#34;
+    }
+
+    return 0
+}
+catch (Exception e)
+{
+    println e
+    return 1
+}
+
+String getCachedToken(String deviceId)
+{
+    def cache = ScriptCache.getCache()
+    def cacheValue = cache.get(&#34;CitrixDaasToken${deviceId}&#34;)
+
+    return cacheValue ?: &#39;&#39;
+}
+
+String getSessionToken(String host, String clientId, String clientSecret, String customerId)
+{
+    def sessionToken = &#39;&#39;
+
+    def postUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(host)
+        .setPath(&#34;/cctrustoauth2/${customerId}/tokens/clients&#34;)
+
+    def postData = []
+    postData.add(new BasicNameValuePair(&#39;grant_type&#39;, &#39;client_credentials&#39;))
+    postData.add(new BasicNameValuePair(&#39;client_id&#39;, clientId))
+    postData.add(new BasicNameValuePair(&#39;client_secret&#39;, clientSecret))
+    def postEntity = new UrlEncodedFormEntity(postData)
+
+    def httpPost = new HttpPost(postUriBuilder.build())
+    httpPost.setHeader(&#39;Accept&#39;, &#39;application/json&#39;)
+    httpPost.setHeader(&#39;Content-Type&#39;, &#39;application/x-www-form-urlencoded&#39;)
+
+    def postResponse = runRequest(httpPost, null, postEntity)
+
+    if (postResponse.code == 200)
+    {
+        def jsonSlurper = new JsonSlurper()
+        def jsonResponse = jsonSlurper.parseText(postResponse.body)
+        sessionToken = jsonResponse.access_token
+    }
+
+    return sessionToken
+}
+
+Map runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)
+{
+    def uriString = uri.toString()
+    def responseMap = [
+        code: null,
+        json: null
+    ]
+
+    while (true)
+    {
+        def httpGet = new HttpGet(uriString)
+
+        if (isCloud)
+        {
+            httpGet.addHeader(&#39;Authorization&#39; , &#34;CwsAuth Bearer=${token}&#34;)
+            httpGet.addHeader(&#39;Citrix-CustomerId&#39; , customerId)
+        }
+
+        def response = runRequest(httpGet, credentials)
+        def jsonSlurper = new JsonSlurper()
+        def json = jsonSlurper.parseText(response.body)
+
+        if (responseMap.code == null)
+        {
+            // a null value in responseMap means this is the first page
+            responseMap.code = response.code
+            responseMap.json = json
+        }
+        else
+        {
+            // for additional pages append the &#34;json.value&#34; list to the existing list
+            responseMap.code = response.code
+            responseMap.json.value.addAll(json.value)
+        }
+
+        if (responseMap.code != 200)
+        {
+            // response is bad, stop now and return as we dont have the full result set
+            return responseMap
+        }
+
+        if (json.get(&#39;@odata.nextLink&#39;) != null)
+        {
+            uriString = json[&#39;@odata.nextLink&#39;]
+        }
+        else
+        {
+            // no &#34;nextLink&#34; means all pages have been queried
+            return responseMap
+        }
+    }
+}
+
+Map runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)
+{
+    if (request instanceof HttpGet != true)
+    {
+        request.setEntity(entity)
+    }
+
+    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion
+    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient
+    def waitPeriod = 0L
+    def serviceRetry = [
+        retryRequest: { response, executionCount, context -&#62;
+            // increase the wait for each try, here we would wait 10, 20 and 30 seconds
+            waitPeriod += 10000L
+            def statusCode = response.getStatusLine().getStatusCode()
+            return executionCount &#60;= 3 &#38;&#38; (statusCode == 429 || statusCode == 500 || statusCode == 503)
+        },
+        getRetryInterval: {
+            return waitPeriod
+        }
+    ] as ServiceUnavailableRetryStrategy
+
+    // create an http client which retries for connection &#34;I/O&#34; errors and for certain http status codes
+    HttpClientBuilder httpClientBuilder = HttpClients.custom()
+        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
+        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))
+        .setServiceUnavailableRetryStrategy(serviceRetry)
+
+    // allow self-signed certificates
+    httpClientBuilder.setSSLContext(
+        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()
+    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+
+    if (credentials)
+    {
+        // attempt authentication with credentials supported by the BasicCredentialsProvider
+        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()
+        credentialProvider.setCredentials(AuthScope.ANY, credentials)
+        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)
+    }
+
+    CloseableHttpClient httpClient = httpClientBuilder.build()
+    HttpResponse response = httpClient.execute(request)
+    String responseBody = null
+
+    if (response.getEntity())
+    {
+        // only attempt to convert the body to string if there is content
+        responseBody = EntityUtils.toString(response.getEntity())
+    }
+
+    Integer code = response.getStatusLine().getStatusCode()
+    List&#60;Header&#62; headers = response.getAllHeaders()
+
+    def responseMap = [
+        code: code,
+        headers: headers,
+        body: responseBody,
+    ]
+
+    httpClient.close()
+    return responseMap
+}
+</wildcardgroovyscript>
+        <wildcardschedule>1440</wildcardschedule>
+        <wildcarddisable>false</wildcarddisable>
+        <wildcarddeleteinactive>false</wildcarddeleteinactive>
+        <agdmethod>ilp</agdmethod>
+        <agdparams>citrixdaas.desktopgroup</agdparams>
+        <group></group>
+        <tags></tags>
+        <technology>Device Properties:
+
+– Citrix Cloud
+citrixdaas.api.id – Citrix Cloud API Client ID.
+citrixdaas.api.key – Citrix Cloud API Client Secret.
+citrixdaas.customerid – Citrix Cloud Customer ID.
+
+– On-prem
+citrixdaas.user – The user name in the NetBIOS DOMAIN\User form.
+citrixdaas.pass – The user password.
+citrixdaas.usehttps – Optional, connect to the Delivery Controller using HTTPS.
+
+– Both
+system.categories – Add &#34;CitrixDaaS&#34;.
+citrixdaas.host – Optional, defaults to the device IP when not set.
+
+Notes:
+
+For Citrix Cloud see the &#34;CitrixDaaS_Token&#34; DataSource for details on creating API credentials.
+
+For On-prem add the &#34;CitrixDaaS&#34; category and the user/pass properties to the device monitoring a Delivery Controller (DDC). The user account requires the Read Only Administrator role.</technology>
+        <adlist><![CDATA[{"agdmethod":"ilp","method":"ad_script","agdparams":"citrixdaas.desktopgroup","id":0,"filters":[{"attribute":"auto.citrixdaas.lifecyclestate","operation":"NotEqual","value":"Deleted"}],"params":{"type":"embeded","groovyscript":"// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas\n\nimport com.santaba.agent.util.script.ScriptCache\nimport groovy.json.JsonSlurper\nimport org.apache.http.client.utils.URIBuilder\nimport org.apache.http.message.BasicNameValuePair\n\n// core http classes\nimport org.apache.http.auth.AuthScope\nimport org.apache.http.auth.Credentials\nimport org.apache.http.auth.NTCredentials\nimport org.apache.http.client.config.*\nimport org.apache.http.client.entity.*\nimport org.apache.http.client.methods.*\nimport org.apache.http.client.ServiceUnavailableRetryStrategy\nimport org.apache.http.conn.ssl.NoopHostnameVerifier\nimport org.apache.http.conn.ssl.TrustSelfSignedStrategy\nimport org.apache.http.entity.*\nimport org.apache.http.Header\nimport org.apache.http.HttpResponse\nimport org.apache.http.impl.client.BasicCredentialsProvider\nimport org.apache.http.impl.client.CloseableHttpClient\nimport org.apache.http.impl.client.HttpClients\nimport org.apache.http.impl.client.HttpClientBuilder\nimport org.apache.http.impl.client.StandardHttpRequestRetryHandler\nimport org.apache.http.ssl.SSLContextBuilder\nimport org.apache.http.util.EntityUtils\n\n// LM properties\ndef propDeviceId = hostProps.get('system.deviceId')\ndef propSystemHost = hostProps.get('system.hostname')\ndef propHost = hostProps.get('citrixdaas.host') ?: propSystemHost\ndef propClientId = hostProps.get('citrixdaas.api.id')\ndef propClientSecret = hostProps.get('citrixdaas.api.key')\ndef propCustomerId = hostProps.get('citrixdaas.customerid')\ndef propUser = hostProps.get('citrixdaas.user')\ndef propPass = hostProps.get('citrixdaas.pass')\ndef propScheme = hostProps.get('citrixdaas.usehttps') ? 'https' : 'http'\n\ndef isCitrixCloud = propClientId && propClientSecret && propCustomerId\ndef sessionToken = ''\ndef ntCredentials = null\n\ndef lifecycleStateMap = [\n    0: 'Active',\n    1: 'Deleted',\n    2: 'Requires Resolution',\n    3: 'Stub'\n]\n\ndef machineRoleMap = [\n    0: 'VDA',\n    1: 'DDC',\n    2: 'Both'\n]\n\ndef machineFunctionalLevelMap = [\n    0: 'L5 (VDA 5.6 FP1)',\n    1: 'L7 (VDA 7.0)',\n    2: 'L7_6 (VDA 7.6)',\n    3: 'L7_7 (VDA 7.7)',\n    4: 'L7_8 (VDA 7.8)',\n    5: 'L7_9 (VDA 7.9)',\n    6: 'L7_20 (VDA 1811)',\n    7: 'L7_25 (VDA 2003)',\n    8: 'L7_30 (VDA 2106)',\n    9: 'L7_34 (VDA 2206)',\n    10: 'L7_?? (VDA 2305)'\n]\n\ntry\n{\n    def mainUriBuilder = new URIBuilder()\n        .setScheme('https')\n        .setHost(propHost)\n        .setPath('/monitorodata/Machines')\n        .setParameter(\n            '$select',\n            'Id,DnsName,LifecycleState,IPAddress,HostingServerName,HostedMachineName,FunctionalLevel,MachineRole'\n        )\n        .setParameter('$expand', 'DesktopGroup($select=Id,Name)')\n        .setParameter('$filter', 'Name ne null and DesktopGroup ne null')\n\n    if (isCitrixCloud)\n    {\n        // get session token for Citrix Cloud API\n        sessionToken = getCachedToken(propDeviceId) ?:\n            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)\n\n        if (sessionToken == '')\n        {\n            println 'Error: Invalid session token).'\n            return 2\n        }\n    }\n    else\n    {\n        // modify request for an on-prem delivery controller\n        mainUriBuilder.setScheme(propScheme)\n        mainUriBuilder.setPath('/Citrix/Monitor/OData/v4/Data/Machines')\n\n        def credDomain = null\n        if (propUser.contains('\\\\'))\n        {\n            credDomain = propUser.tokenize('\\\\')[0]\n            credUser = propUser.tokenize('\\\\')[1]\n        }\n        else\n        {\n            throw new Exception(\"The 'citrixdaas.user' property must be in the DOMAIN\\\\User format.\")\n        }\n\n        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)\n    }\n\n    def mainUri = mainUriBuilder.build()\n    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)\n\n    if (mainResponse.code == 429)\n    {\n        // rate limit response code\n        println \"Error: Bad response code (${mainResponse.code}).\"\n        return 3\n    }\n    else if (mainResponse.code != 200)\n    {\n        println \"Error: Bad response code (${mainResponse.code}).\"\n        return 4\n    }\n\n    mainResponse.json.value.each { machine ->\n        def wildValue = machine.Id\n        // in some environments the HostedMachineName is not populated, so fall back to the DnsName\n        def wildAlias = machine.HostedMachineName ?: machine.DnsName\n\n        def instanceProperties = [\n            'citrixdaas.desktopgroup' : machine.DesktopGroup.Name,\n            'citrixdaas.functionallevel' : machineFunctionalLevelMap.getOrDefault(machine.FunctionalLevel, -1),\n            'citrixdaas.hostingservername' : machine.HostingServerName,\n            'citrixdaas.ipaddress' : machine.IPAddress,\n            'citrixdaas.lifecyclestate' : lifecycleStateMap.getOrDefault(machine.LifecycleState, -1),\n            'citrixdaas.role' : machineRoleMap.getOrDefault(machine.MachineRole, -1)\n        ]\n\n        // Encode the instance property strings to escape any HTTP/URL special characters, the wild value/alias strings\n        // appear to be encoded by LogicMontor automatically.\n        instanceProperyStrings = instanceProperties.collect { property, value ->\n            URLEncoder.encode(property, 'UTF-8') + '=' + URLEncoder.encode(value.toString(), 'UTF-8')\n        }\n\n        println \"${wildValue}##${wildAlias}######${instanceProperyStrings.join('&')}\"\n    }\n\n    return 0\n}\ncatch (Exception e)\n{\n    println e\n    return 1\n}\n\nString getCachedToken(String deviceId)\n{\n    def cache = ScriptCache.getCache()\n    def cacheValue = cache.get(\"CitrixDaasToken${deviceId}\")\n\n    return cacheValue ?: ''\n}\n\nString getSessionToken(String host, String clientId, String clientSecret, String customerId)\n{\n    def sessionToken = ''\n\n    def postUriBuilder = new URIBuilder()\n        .setScheme('https')\n        .setHost(host)\n        .setPath(\"/cctrustoauth2/${customerId}/tokens/clients\")\n\n    def postData = []\n    postData.add(new BasicNameValuePair('grant_type', 'client_credentials'))\n    postData.add(new BasicNameValuePair('client_id', clientId))\n    postData.add(new BasicNameValuePair('client_secret', clientSecret))\n    def postEntity = new UrlEncodedFormEntity(postData)\n\n    def httpPost = new HttpPost(postUriBuilder.build())\n    httpPost.setHeader('Accept', 'application/json')\n    httpPost.setHeader('Content-Type', 'application/x-www-form-urlencoded')\n\n    def postResponse = runRequest(httpPost, null, postEntity)\n\n    if (postResponse.code == 200)\n    {\n        def jsonSlurper = new JsonSlurper()\n        def jsonResponse = jsonSlurper.parseText(postResponse.body)\n        sessionToken = jsonResponse.access_token\n    }\n\n    return sessionToken\n}\n\nMap runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)\n{\n    def uriString = uri.toString()\n    def responseMap = [\n        code: null,\n        json: null\n    ]\n\n    while (true)\n    {\n        def httpGet = new HttpGet(uriString)\n\n        if (isCloud)\n        {\n            httpGet.addHeader('Authorization' , \"CwsAuth Bearer=${token}\")\n            httpGet.addHeader('Citrix-CustomerId' , customerId)\n        }\n\n        def response = runRequest(httpGet, credentials)\n        def jsonSlurper = new JsonSlurper()\n        def json = jsonSlurper.parseText(response.body)\n\n        if (responseMap.code == null)\n        {\n            // a null value in responseMap means this is the first page\n            responseMap.code = response.code\n            responseMap.json = json\n        }\n        else\n        {\n            // for additional pages append the \"json.value\" list to the existing list\n            responseMap.code = response.code\n            responseMap.json.value.addAll(json.value)\n        }\n\n        if (responseMap.code != 200)\n        {\n            // response is bad, stop now and return as we dont have the full result set\n            return responseMap\n        }\n\n        if (json.get('@odata.nextLink') != null)\n        {\n            uriString = json['@odata.nextLink']\n        }\n        else\n        {\n            // no \"nextLink\" means all pages have been queried\n            return responseMap\n        }\n    }\n}\n\nMap runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)\n{\n    if (request instanceof HttpGet != true)\n    {\n        request.setEntity(entity)\n    }\n\n    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion\n    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient\n    def waitPeriod = 0L\n    def serviceRetry = [\n        retryRequest: { response, executionCount, context ->\n            // increase the wait for each try, here we would wait 10, 20 and 30 seconds\n            waitPeriod += 10000L\n            def statusCode = response.getStatusLine().getStatusCode()\n            return executionCount <= 3 && (statusCode == 429 || statusCode == 500 || statusCode == 503)\n        },\n        getRetryInterval: {\n            return waitPeriod\n        }\n    ] as ServiceUnavailableRetryStrategy\n\n    // create an http client which retries for connection \"I/O\" errors and for certain http status codes\n    HttpClientBuilder httpClientBuilder = HttpClients.custom()\n        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())\n        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))\n        .setServiceUnavailableRetryStrategy(serviceRetry)\n\n    // allow self-signed certificates\n    httpClientBuilder.setSSLContext(\n        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()\n    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)\n\n    if (credentials)\n    {\n        // attempt authentication with credentials supported by the BasicCredentialsProvider\n        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()\n        credentialProvider.setCredentials(AuthScope.ANY, credentials)\n        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)\n    }\n\n    CloseableHttpClient httpClient = httpClientBuilder.build()\n    HttpResponse response = httpClient.execute(request)\n    String responseBody = null\n\n    if (response.getEntity())\n    {\n        // only attempt to convert the body to string if there is content\n        responseBody = EntityUtils.toString(response.getEntity())\n    }\n\n    Integer code = response.getStatusLine().getStatusCode()\n    List<Header> headers = response.getAllHeaders()\n\n    def responseMap = [\n        code: code,\n        headers: headers,\n        body: responseBody,\n    ]\n\n    httpClient.close()\n    return responseMap\n}\n"}}]]></adlist>
+        <schemaVersion>2</schemaVersion>
+        <dataSourceType>1</dataSourceType>
+        <attributes>
+        <attribute>
+            <name>scripttype</name>
+            <value>embed</value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>scriptgroovy</name>
+            <value>// Copyright (c) 2023 Chris Redit. All rights reserved. https://github.com/chrisred/logicmonitor-citrixdaas
+
+import com.santaba.agent.util.script.ScriptCache
+import groovy.json.JsonSlurper
+import java.time.format.DateTimeFormatter
+import java.time.ZonedDateTime
+import java.time.ZoneId
+import org.apache.http.client.utils.URIBuilder
+import org.apache.http.message.BasicNameValuePair
+
+// core http classes
+import org.apache.http.auth.AuthScope
+import org.apache.http.auth.Credentials
+import org.apache.http.auth.NTCredentials
+import org.apache.http.client.config.*
+import org.apache.http.client.entity.*
+import org.apache.http.client.methods.*
+import org.apache.http.client.ServiceUnavailableRetryStrategy
+import org.apache.http.conn.ssl.NoopHostnameVerifier
+import org.apache.http.conn.ssl.TrustSelfSignedStrategy
+import org.apache.http.entity.*
+import org.apache.http.Header
+import org.apache.http.HttpResponse
+import org.apache.http.impl.client.BasicCredentialsProvider
+import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.client.HttpClientBuilder
+import org.apache.http.impl.client.StandardHttpRequestRetryHandler
+import org.apache.http.ssl.SSLContextBuilder
+import org.apache.http.util.EntityUtils
+
+// LM properties
+def propDeviceId = hostProps.get(&#39;system.deviceId&#39;)
+def propSystemHost = hostProps.get(&#39;system.hostname&#39;)
+def propHost = hostProps.get(&#39;citrixdaas.host&#39;) ?: propSystemHost
+def propClientId = hostProps.get(&#39;citrixdaas.api.id&#39;)
+def propClientSecret = hostProps.get(&#39;citrixdaas.api.key&#39;)
+def propCustomerId = hostProps.get(&#39;citrixdaas.customerid&#39;)
+def propUser = hostProps.get(&#39;citrixdaas.user&#39;)
+def propPass = hostProps.get(&#39;citrixdaas.pass&#39;)
+def propScheme = hostProps.get(&#39;citrixdaas.usehttps&#39;) ? &#39;https&#39; : &#39;http&#39;
+
+def isCitrixCloud = propClientId &#38;&#38; propClientSecret &#38;&#38; propCustomerId
+def sessionToken = &#39;&#39;
+def ntCredentials = null
+def dateFormat = DateTimeFormatter.ofPattern(&#34;yyyy-MM-dd&#39;T&#39;HH:mm:ss.SSSX&#34;)
+def utcNow = ZonedDateTime.now(ZoneId.of(&#39;UTC&#39;))
+
+try
+{
+    // make sure we get a ResourceUtilization entry, these are created every 5 mins
+    def resourceStartDate = utcNow.minusMinutes(8)
+    def resouceFormattedDate = resourceStartDate.format(dateFormat)
+
+    def mainUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(propHost)
+        .setPath(&#39;/monitorodata/Machines&#39;)
+        .setParameter(
+            &#39;$select&#39;,
+            &#39;Id,Name,IsAssigned,IsInMaintenanceMode,IsPendingUpdate,CurrentRegistrationState,LastDeregisteredCode,&#39; +
+            &#39;CurrentPowerState,CurrentSessionCount,IsPreparing,FaultState&#39;
+        )
+        .setParameter(
+            &#39;$expand&#39;,
+            &#39;CurrentLoadIndex($select=EffectiveLoadIndex,Cpu,Memory,Disk,Network,CreatedDate),&#39; +
+            &#39;DesktopGroup($select=Id,Name),ResourceUtilization($select=PercentCpu,UsedMemory,TotalMemory,CreatedDate;&#39; +
+            &#34;\$filter=CreatedDate gt cast(${resouceFormattedDate},Edm.DateTimeOffset))&#34;
+        )
+        .setParameter(&#39;$filter&#39;, &#39;Name ne null and DesktopGroup ne null&#39;)
+
+    if (isCitrixCloud)
+    {
+        // get session token for Citrix Cloud API
+        sessionToken = getCachedToken(propDeviceId) ?:
+            getSessionToken(propHost, propClientId, propClientSecret, propCustomerId)
+
+        if (sessionToken == &#39;&#39;)
+        {
+            println &#39;Error: Invalid session token.&#39;
+            return 2
+        }
+    }
+    else
+    {
+        // modify request for an on-prem delivery controller
+        mainUriBuilder.setScheme(propScheme)
+        mainUriBuilder.setPath(&#39;/Citrix/Monitor/OData/v4/Data/Machines&#39;)
+
+        def credDomain = null
+        if (propUser.contains(&#39;\\&#39;))
+        {
+            credDomain = propUser.tokenize(&#39;\\&#39;)[0]
+            credUser = propUser.tokenize(&#39;\\&#39;)[1]
+        }
+        else
+        {
+            throw new Exception(&#34;The &#39;citrixdaas.user&#39; property must be in the DOMAIN\\User format.&#34;)
+        }
+
+        ntCredentials = new NTCredentials(credUser, propPass, propHost, credDomain)
+    }
+
+    def mainUri = mainUriBuilder.build()
+    def mainResponse = runCitrixRequest(mainUri, sessionToken, propCustomerId, ntCredentials, isCitrixCloud)
+
+    if (mainResponse.code == 429)
+    {
+        // rate limit response code
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 3
+    }
+    else if (mainResponse.code != 200)
+    {
+        println &#34;Error: Bad response code (${mainResponse.code}).&#34;
+        return 4
+    }
+
+    mainResponse.json.value.each { machine -&#62;
+        def wildValue = machine.Id
+
+        output(&#39;IsAssigned&#39;, machine.IsAssigned, wildValue)
+        output(&#39;IsInMaintenanceMode&#39;, machine.IsInMaintenanceMode, wildValue)
+        output(&#39;IsPendingUpdate&#39;, machine.IsPendingUpdate, wildValue)
+        output(&#39;CurrentRegistrationState&#39;, machine.CurrentRegistrationState, wildValue)
+        output(&#39;LastDeregisteredCode&#39;, machine.LastDeregisteredCode, wildValue)
+        output(&#39;CurrentPowerState&#39;, machine.CurrentPowerState, wildValue)
+        output(&#39;CurrentSessionCount&#39;, machine.CurrentSessionCount, wildValue)
+        output(&#39;IsPreparing&#39;, machine.IsPreparing, wildValue)
+        output(&#39;FaultState&#39;, machine.FaultState, wildValue)
+
+        // A load index of 0 means the machine is off or not fully initialized, CurrentLoadIndex can also be
+        // null when a machine is off or has no sessions in certain Citrix versions.
+        if (machine.CurrentLoadIndex?.EffectiveLoadIndex &#62; 0)
+        {
+            output(&#39;EffectiveLoadIndex&#39;, machine.CurrentLoadIndex.EffectiveLoadIndex, wildValue)
+            output(&#39;CpuLoadIndex&#39;, machine.CurrentLoadIndex.Cpu, wildValue)
+            output(&#39;MemoryLoadIndex&#39;, machine.CurrentLoadIndex.Memory, wildValue)
+            output(&#39;DiskLoadIndex&#39;, machine.CurrentLoadIndex.Disk, wildValue)
+            output(&#39;NetworkLoadIndex&#39;, machine.CurrentLoadIndex.Network, wildValue)
+        }
+        else
+        {
+            output(&#39;EffectiveLoadIndex&#39;, 0, wildValue)
+            output(&#39;CpuLoadIndex&#39;, 0, wildValue)
+            output(&#39;MemoryLoadIndex&#39;, 0, wildValue)
+            output(&#39;DiskLoadIndex&#39;, 0, wildValue)
+            output(&#39;NetworkLoadIndex&#39;, 0, wildValue)
+        }
+
+        // no resource utilization data means the machine is off or not fully initialized
+        if (machine.ResourceUtilization.size() &#62; 0)
+        {
+            def percentCpu = BigDecimal.valueOf(machine.ResourceUtilization.last().PercentCpu)
+            def usedMemory = BigDecimal.valueOf(machine.ResourceUtilization.last().UsedMemory)
+            def totalMemory = BigDecimal.valueOf(machine.ResourceUtilization.last().TotalMemory)
+
+            output(&#39;PercentCpu&#39;, roundTo(percentCpu), wildValue)
+            output(&#39;UsedMemory&#39;, roundTo(usedMemory), wildValue)
+            output(&#39;TotalMemory&#39;, roundTo(totalMemory), wildValue)
+        }
+    }
+
+    return 0
+}
+catch (Exception e)
+{
+    println e
+    return 1
+}
+
+BigDecimal roundTo(Number value)
+{
+    return BigDecimal.valueOf(value).setScale(2, BigDecimal.ROUND_HALF_UP).stripTrailingZeros()
+}
+
+String getCachedToken(String deviceId)
+{
+    def cache = ScriptCache.getCache()
+    def cacheValue = cache.get(&#34;CitrixDaasToken${deviceId}&#34;)
+
+    return cacheValue ?: &#39;&#39;
+}
+
+String getSessionToken(String host, String clientId, String clientSecret, String customerId)
+{
+    def sessionToken = &#39;&#39;
+
+    def postUriBuilder = new URIBuilder()
+        .setScheme(&#39;https&#39;)
+        .setHost(host)
+        .setPath(&#34;/cctrustoauth2/${customerId}/tokens/clients&#34;)
+
+    def postData = []
+    postData.add(new BasicNameValuePair(&#39;grant_type&#39;, &#39;client_credentials&#39;))
+    postData.add(new BasicNameValuePair(&#39;client_id&#39;, clientId))
+    postData.add(new BasicNameValuePair(&#39;client_secret&#39;, clientSecret))
+    def postEntity = new UrlEncodedFormEntity(postData)
+
+    def httpPost = new HttpPost(postUriBuilder.build())
+    httpPost.setHeader(&#39;Accept&#39;, &#39;application/json&#39;)
+    httpPost.setHeader(&#39;Content-Type&#39;, &#39;application/x-www-form-urlencoded&#39;)
+
+    def postResponse = runRequest(httpPost, null, postEntity)
+
+    if (postResponse.code == 200)
+    {
+        def jsonSlurper = new JsonSlurper()
+        def jsonResponse = jsonSlurper.parseText(postResponse.body)
+        sessionToken = jsonResponse.access_token
+    }
+
+    return sessionToken
+}
+
+Map runCitrixRequest(URI uri, String token, String customerId, Credentials credentials, Boolean isCloud)
+{
+    def uriString = uri.toString()
+    def responseMap = [
+        code: null,
+        json: null
+    ]
+
+    while (true)
+    {
+        def httpGet = new HttpGet(uriString)
+
+        if (isCloud)
+        {
+            httpGet.addHeader(&#39;Authorization&#39; , &#34;CwsAuth Bearer=${token}&#34;)
+            httpGet.addHeader(&#39;Citrix-CustomerId&#39; , customerId)
+        }
+
+        def response = runRequest(httpGet, credentials)
+        def jsonSlurper = new JsonSlurper()
+        def json = jsonSlurper.parseText(response.body)
+
+        if (responseMap.code == null)
+        {
+            // a null value in responseMap means this is the first page
+            responseMap.code = response.code
+            responseMap.json = json
+        }
+        else
+        {
+            // for additional pages append the &#34;json.value&#34; list to the existing list
+            responseMap.code = response.code
+            responseMap.json.value.addAll(json.value)
+        }
+
+        if (responseMap.code != 200)
+        {
+            // response is bad, stop now and return as we dont have the full result set
+            return responseMap
+        }
+
+        if (json.get(&#39;@odata.nextLink&#39;) != null)
+        {
+            uriString = json[&#39;@odata.nextLink&#39;]
+        }
+        else
+        {
+            // no &#34;nextLink&#34; means all pages have been queried
+            return responseMap
+        }
+    }
+}
+
+Map runRequest(HttpRequestBase request, Credentials credentials=null, AbstractHttpEntity entity=null)
+{
+    if (request instanceof HttpGet != true)
+    {
+        request.setEntity(entity)
+    }
+
+    // http://docs.groovy-lang.org/docs/groovy-2.4.21/html/documentation/#_map_to_type_coercion
+    // https://stackoverflow.com/questions/48541329/timeout-between-request-retries-apache-httpclient
+    def waitPeriod = 0L
+    def serviceRetry = [
+        retryRequest: { response, executionCount, context -&#62;
+            // increase the wait for each try, here we would wait 10, 20 and 30 seconds
+            waitPeriod += 10000L
+            def statusCode = response.getStatusLine().getStatusCode()
+            return executionCount &#60;= 3 &#38;&#38; (statusCode == 429 || statusCode == 500 || statusCode == 503)
+        },
+        getRetryInterval: {
+            return waitPeriod
+        }
+    ] as ServiceUnavailableRetryStrategy
+
+    // create an http client which retries for connection &#34;I/O&#34; errors and for certain http status codes
+    HttpClientBuilder httpClientBuilder = HttpClients.custom()
+        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
+        .setRetryHandler(new StandardHttpRequestRetryHandler(3, false))
+        .setServiceUnavailableRetryStrategy(serviceRetry)
+
+    // allow self-signed certificates
+    httpClientBuilder.setSSLContext(
+        new SSLContextBuilder().loadTrustMaterial(null, TrustSelfSignedStrategy.INSTANCE).build()
+    ).setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+
+    if (credentials)
+    {
+        // attempt authentication with credentials supported by the BasicCredentialsProvider
+        BasicCredentialsProvider credentialProvider = new BasicCredentialsProvider()
+        credentialProvider.setCredentials(AuthScope.ANY, credentials)
+        httpClientBuilder.setDefaultCredentialsProvider(credentialProvider)
+    }
+
+    CloseableHttpClient httpClient = httpClientBuilder.build()
+    HttpResponse response = httpClient.execute(request)
+    String responseBody = null
+
+    if (response.getEntity())
+    {
+        // only attempt to convert the body to string if there is content
+        responseBody = EntityUtils.toString(response.getEntity())
+    }
+
+    Integer code = response.getStatusLine().getStatusCode()
+    List&#60;Header&#62; headers = response.getAllHeaders()
+
+    def responseMap = [
+        code: code,
+        headers: headers,
+        body: responseBody,
+    ]
+
+    httpClient.close()
+    return responseMap
+}
+
+void output(key, value, instanceId=null)
+{
+    if (value instanceof BigDecimal)
+    {
+        // make sure BigDecimal does not render to string with Scientific Notation
+        value = value.toPlainString()
+    }
+
+    if (value instanceof Boolean)
+    {
+        value = value ? 1:0
+    }
+
+    if (instanceId)
+    {
+        println &#34;${instanceId}.${key}=${value}&#34;
+    }
+    else
+    {
+        println &#34;${key}=${value}&#34;
+    }
+}</value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>windowsscript</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>linuxscript</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>windowscmdline</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>linuxcmdline</name>
+            <value></value>
+            <comment></comment>
+        </attribute>
+        <attribute>
+            <name>__filter_0</name>
+            <value>auto.citrixdaas.lifecyclestate	NotEqual	Deleted</value>
+            <comment></comment>
+        </attribute>
+        </attributes>
+        <datapoints>
+        <datapoint>
+            <name>ExitCode</name>
+            <originId>DQQl2ViaRri742gpAoJ1iw</originId>
+            <dataType>4</dataType>
+            <type>2</type>
+            <postprocessormethod>none</postprocessormethod>
+            <postprocessorparam></postprocessorparam>
+            <usevalue>exitCode</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description></description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>CurrentSessionCount</name>
+            <originId>-yXz40nTQb2eZ5iIemavQw</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.CurrentSessionCount</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The current connected session count.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>PercentCpu</name>
+            <originId>E25R_wDwSCuQsz296sVhCw</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.PercentCpu</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS session host ##INSTANCE## monitored via ##HOST## has CPU usage at ##VALUE## percent, placing the machine into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The CPU usage in percent.</description>
+            <maxvalue>100</maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>4</alertTransitionIval>
+            <alertClearTransitionIval>1</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>TotalMemory</name>
+            <originId>HGWrNVuATMGwZ4rtsR-b4A</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.TotalMemory</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The total physical memory available in bytes.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>UsedMemory</name>
+            <originId>Ktnd53_DSIeN468xgs2Bcg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.UsedMemory</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The used physical memory in bytes.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>PercentMemory</name>
+            <originId>IgfO7sZETD6fB8x4rIJamQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>expression</postprocessormethod>
+            <postprocessorparam>(UsedMemory/TotalMemory)*100</postprocessorparam>
+            <usevalue></usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS session host ##INSTANCE## monitored via ##HOST## has physical memory usage at ##VALUE## percent, placing the machine into a ##LEVEL## state.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The memory usage in percent.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>4</alertTransitionIval>
+            <alertClearTransitionIval>1</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>CpuLoadIndex</name>
+            <originId>4DDTH3PkShaBF_f9DMxlFA</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.CpuLoadIndex</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The CPU load index (out of 10000). This will only return a value if the CPU load management policy is configured.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>DiskLoadIndex</name>
+            <originId>f29d30V2RUKh6hqoDZnDHg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.DiskLoadIndex</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The disk load index (out of 10000). This will only return a value if the disk load management policy is configured.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>EffectiveLoadIndex</name>
+            <originId>IxN-H2keRwS5ravaHAyJRg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.EffectiveLoadIndex</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Load index from 0 to 10000 (10000 being fully loaded and not accepting connections). By default the load index is calculated using the session count. For the calculation to include available resources (CPU, Memory, Disk) these must be enabled in the HDX Load Management policy.</description>
+            <maxvalue>10000</maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>MemoryLoadIndex</name>
+            <originId>21Qte5SESWez2Skz43lg7Q</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.MemoryLoadIndex</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The memory load index (out of 10000). This will only return a value if the memory load management policy is configured.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>NetworkLoadIndex</name>
+            <originId>MrKRjd_WRkm59Sl8MaSpiA</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.NetworkLoadIndex</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The network load index (out of 10000). This will only return a value if the network load management policy is configured.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>EffectiveLoadIndexPercent</name>
+            <originId>TiAJxbKXRRus5-RTUYDdrQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>expression</postprocessormethod>
+            <postprocessorparam>(EffectiveLoadIndex/10000)*100</postprocessorparam>
+            <usevalue></usevalue>
+            <alertexpr>&#62;= 90 95</alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS session host ##INSTANCE## monitored via ##HOST## has a load index value of ##VALUE## percent, placing the machine into a ##LEVEL## state. This could indicate the session host is under high load.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The effective load index in percent.</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>3</alertTransitionIval>
+            <alertClearTransitionIval>1</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>CurrentPowerState</name>
+            <originId>nc5o1lGxRpGluCpH9AYllw</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.CurrentPowerState</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The current power state.
+
+Status codes:
+0=Unknown
+1=Unavailable
+2=Off
+3=On
+4=Suspended
+5=TurningOn
+6=TurningOff
+7=Suspending
+8=Resuming
+9=Unmanaged
+10=NotSupported</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>CurrentRegistrationState</name>
+            <originId>dfvmQ0ieRpymuRaQR8xr4w</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.CurrentRegistrationState</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The current registration state.
+
+Status codes:
+0=Unknown
+1=Registered
+2=Unregistred</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>FaultState</name>
+            <originId>R0Tn0sUUQJyFxGJlmRah4g</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.FaultState</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The fault state.
+
+Status codes:
+0=Unknown
+1=None
+2=FailedToStart
+3=StuckOnBoot
+4=Unregistered
+5=MaxCapacity</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>IsAssigned</name>
+            <originId>2Kir5cgWRSaKODc51ToYmg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.IsAssigned</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Whether a private desktop has been assigned to a user or client.
+
+Status codes:
+0=False
+1=True</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>IsInMaintenanceMode</name>
+            <originId>X8LcHfdVQhieLvhKrqNftA</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.IsInMaintenanceMode</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Whether the machine is in maintenance mode.
+
+Status codes:
+0=False
+1=True</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>IsPreparing</name>
+            <originId>QFul52xFSKSGHUhfOVBDEg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.IsPreparing</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Whether the personal vDisk for the machine is preparing.
+
+Status codes:
+0=False
+1=True</description>
+            <maxvalue></maxvalue>
+            <minvalue></minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>LastDeregisteredCode</name>
+            <originId>ThYY2oPJRfaOkst24SSFwg</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>namevalue</postprocessormethod>
+            <postprocessorparam>##WILDVALUE##.LastDeregisteredCode</postprocessorparam>
+            <usevalue>output</usevalue>
+            <alertexpr></alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody></alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>The last deregistration reason code.
+
+Status codes:
+0=AgentShutdown
+1=AgentSuspended
+2=AgentRequested
+100=IncompatibleVersion
+101=AgentAddressResolutionFailed
+102=AgentNotContactable
+103=AgentWrongActiveDirectoryOU
+104=EmptyRegistrationRequest
+105=MissingRegistrationCapabilities
+106=MissingAgentVersion
+107=InconsistentRegistrationCapabilities
+108=NotLicensedForFeature
+109=UnsupportedCredentialSecurityVersion
+110=InvalidRegistrationRequest
+111=SingleMultiSessionMismatch
+112=FunctionalLevelTooLowForCatalog
+113=FunctionalLevelTooLowForDesktopGroup
+200=PowerOff
+201=DesktopRestart
+202=DesktopRemoved
+203=AgentRejectedSettingsUpdate
+204=SendSettingsFailure
+205=SessionAuditFailure
+206=SessionPrepareFailure
+207=ContactLost
+208=SettingsCreationFailure
+300=UnknownError
+301=BrokerRegistrationLimitReached
+400=None
+401=HypervisorReportedFailure
+402=HypervisorRateLimitExceeded
+1000=HardRegistrationPending
+1001=SoftRegistered
+1002=Unknown</description>
+            <maxvalue></maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>0</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>FailedToStartAlert</name>
+            <originId>lkB8-bj1QZ-uupQOtxh9Ig</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>expression</postprocessormethod>
+            <postprocessorparam>if(eq(FaultState, 2), 1, 0)</postprocessorparam>
+            <usevalue></usevalue>
+            <alertexpr>!= 0 0</alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS session host ##INSTANCE## monitored via ##HOST## has failed to start.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Returns true if the machine failed to start.
+
+Status codes:
+0=False
+1=True</description>
+            <maxvalue>1</maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>2</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>StuckOnBootAlert</name>
+            <originId>OCUhaBYWQsWB1T7jUdS4NQ</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>expression</postprocessormethod>
+            <postprocessorparam>if(eq(FaultState, 3), 1, 0)</postprocessorparam>
+            <usevalue></usevalue>
+            <alertexpr>!= 0 0</alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS session host ##INSTANCE## monitored via ##HOST## is stuck on boot.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Returns true if the machine is stuck on boot.
+
+Status codes:
+0=False
+1=True</description>
+            <maxvalue>1</maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>2</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>UnregisteredAlert</name>
+            <originId>LHu1VsffR86aOoe0_zlOSA</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>expression</postprocessormethod>
+            <postprocessorparam>&#38;&#38;((eq(CurrentPowerState,3)),(eq(FaultState,4)))</postprocessorparam>
+            <usevalue></usevalue>
+            <alertexpr>!= 0 0</alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS session host ##INSTANCE## monitored via ##HOST## is unregistered.
+
+This started at ##START##, -or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Returns true if a machine is powered on and is unregistered.
+
+Status codes:
+0=False
+1=True</description>
+            <maxvalue>1</maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>2</alertTransitionIval>
+            <alertClearTransitionIval>0</alertClearTransitionIval>
+        </datapoint>
+        <datapoint>
+            <name>MaximumCapacityAlert</name>
+            <originId>useFdPzWTWurEoN6HA_k4g</originId>
+            <dataType>7</dataType>
+            <type>2</type>
+            <postprocessormethod>expression</postprocessormethod>
+            <postprocessorparam>if(eq(FaultState, 5), 1, 0)</postprocessorparam>
+            <usevalue></usevalue>
+            <alertexpr>!= 0</alertexpr>
+            <alertmissing>1</alertmissing>
+            <alertsubject></alertsubject>
+            <alertbody>The Citrix DaaS session host ##INSTANCE## monitored via ##HOST## has reached maximum capacity.
+
+This started at ##START##, or ##DURATION## ago.</alertbody>
+            <enableanomalyalertsuppression></enableanomalyalertsuppression>
+            <adadvsettingenabled>false</adadvsettingenabled>
+            <warnadadvsetting></warnadadvsetting>
+            <erroradadvsetting></erroradadvsetting>
+            <criticaladadvsetting></criticaladadvsetting>
+            <description>Returns true if the machine has reached the maximum session capacity.
+
+Status codes:
+0=False
+1=True</description>
+            <maxvalue>1</maxvalue>
+            <minvalue>0</minvalue>
+            <maxdigits>4</maxdigits>
+            <userparam1></userparam1>
+            <userparam2></userparam2>
+            <userparam3></userparam3>
+            <iscomposite>false</iscomposite>
+            <rpn></rpn>
+            <alertTransitionIval>2</alertTransitionIval>
+            <alertClearTransitionIval>1</alertClearTransitionIval>
+        </datapoint>
+        </datapoints>
+        <graphs>
+        <graph>
+            <name>Active Sessions</name>
+            <title>Active Sessions</title>
+            <originId></originId>            <verticallabel>count</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>1</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>CurrentSessionCount</name>
+            <datapointname>CurrentSessionCount</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>2</type>
+                <legend>Session Count</legend>
+                <color>blue</color>
+                <datapointname>CurrentSessionCount</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        <graph>
+            <name>CPU and Memory Usage</name>
+            <title>CPU and Memory Usage</title>
+            <originId></originId>            <verticallabel>percentage</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>2</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>PercentCpu</name>
+            <datapointname>PercentCpu</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>PercentMemory</name>
+            <datapointname>PercentMemory</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>1</type>
+                <legend>PercentCpu</legend>
+                <color>red2</color>
+                <datapointname>PercentCpu</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>1</type>
+                <legend>PercentMemory</legend>
+                <color>yellow</color>
+                <datapointname>PercentMemory</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        <graph>
+            <name>Fault State Alerts</name>
+            <title>Fault State Alerts</title>
+            <originId></originId>            <verticallabel>state</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>1.0</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>5</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>FailedToStartAlert</name>
+            <datapointname>FailedToStartAlert</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>MaximumCapacityAlert</name>
+            <datapointname>MaximumCapacityAlert</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>StuckOnBootAlert</name>
+            <datapointname>StuckOnBootAlert</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>UnregistedAlert</name>
+            <datapointname>UnregisteredAlert</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>1</type>
+                <legend>Failed To Start Alert</legend>
+                <color>blue</color>
+                <datapointname>FailedToStartAlert</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>1</type>
+                <legend>Maximum Capacity Alert</legend>
+                <color>green</color>
+                <datapointname>MaximumCapacityAlert</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>1</type>
+                <legend>Stuck On Boot Alert</legend>
+                <color>red1</color>
+                <datapointname>StuckOnBootAlert</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>1</type>
+                <legend>Unregisted Alert</legend>
+                <color>orange</color>
+                <datapointname>UnregistedAlert</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        <graph>
+            <name>Last Deregistered Code</name>
+            <title>Last Deregistered Code</title>
+            <originId></originId>            <verticallabel>deregister code</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>6</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>LastDeregisteredCode</name>
+            <datapointname>LastDeregisteredCode</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>1</type>
+                <legend>LastDeregisteredCode</legend>
+                <color>blue</color>
+                <datapointname>LastDeregisteredCode</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        <graph>
+            <name>Machine State</name>
+            <title>Machine State</title>
+            <originId></originId>            <verticallabel>state code</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>3</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>CurrentPowerState</name>
+            <datapointname>CurrentPowerState</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>CurrentRegistrationState</name>
+            <datapointname>CurrentRegistrationState</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>FaultState</name>
+            <datapointname>FaultState</datapointname>
+            <originId></originId>
+            <cf>2</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>1</type>
+                <legend>Power State</legend>
+                <color>blue</color>
+                <datapointname>CurrentPowerState</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>1</type>
+                <legend>Registration State</legend>
+                <color>green</color>
+                <datapointname>CurrentRegistrationState</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>1</type>
+                <legend>Fault State</legend>
+                <color>red1</color>
+                <datapointname>FaultState</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        <graph>
+            <name>Memory Stats</name>
+            <title>Memory Stats</title>
+            <originId></originId>            <verticallabel>bytes</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>4</displayprio>
+            <timescale>1day</timescale>
+            <base1024>true</base1024>
+            <graphdatapoints>
+        <graphdatapoint>
+            <name>TotalMemory</name>
+            <datapointname>TotalMemory</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+        <graphdatapoint>
+            <name>UsedMemory</name>
+            <datapointname>UsedMemory</datapointname>
+            <originId></originId>
+            <cf>1</cf>
+        </graphdatapoint>
+            </graphdatapoints>
+            <graphvirtualdatapoints>
+            </graphvirtualdatapoints>
+            <graphdatas>
+            <graphdata>
+                <type>1</type>
+                <legend>TotalMemory</legend>
+                <color>blue</color>
+                <datapointname>TotalMemory</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            <graphdata>
+                <type>2</type>
+                <legend>UsedMemory</legend>
+                <color>red1</color>
+                <datapointname>UsedMemory</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+            </graphdata>
+            </graphdatas>
+        </graph>
+        </graphs>
+        <overviewgraphs>
+        <overviewgraph>
+            <name>Connected Sessions</name>
+            <title>Top Connected Sessions</title>
+            <verticallabel>session</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>2</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <aggregated>false</aggregated>
+            <originId></originId>
+            <datapoints>
+        <overviewgraphdatapoint>
+            <name>CurrentSessionCount</name>
+            <datapointname>CurrentSessionCount</datapointname>
+            <cf>1</cf>
+            <aggregateMethod>sum</aggregateMethod>
+            <originId></originId>
+        </overviewgraphdatapoint>
+            </datapoints>
+            <virtualdatapoints>
+            </virtualdatapoints>
+            <lines>
+            <overviewgraphline>
+                <type>1</type>
+                <legend>##INSTANCE##</legend>
+                <datapointname>CurrentSessionCount</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+                <color>silver</color>
+            </overviewgraphline>
+            </lines>
+        </overviewgraph>
+        <overviewgraph>
+            <name>CPU Usage</name>
+            <title>Top CPU Usage</title>
+            <verticallabel>percentage</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>100.0</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>1</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <aggregated>false</aggregated>
+            <originId></originId>
+            <datapoints>
+        <overviewgraphdatapoint>
+            <name>PercentCpu</name>
+            <datapointname>PercentCpu</datapointname>
+            <cf>1</cf>
+            <aggregateMethod>sum</aggregateMethod>
+            <originId></originId>
+        </overviewgraphdatapoint>
+            </datapoints>
+            <virtualdatapoints>
+            </virtualdatapoints>
+            <lines>
+            <overviewgraphline>
+                <type>1</type>
+                <legend>##INSTANCE##</legend>
+                <datapointname>PercentCpu</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+                <color>silver</color>
+            </overviewgraphline>
+            </lines>
+        </overviewgraph>
+        <overviewgraph>
+            <name>Load Index</name>
+            <title>Top Load Index</title>
+            <verticallabel>value</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>NaN</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>4</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <aggregated>false</aggregated>
+            <originId></originId>
+            <datapoints>
+        <overviewgraphdatapoint>
+            <name>EffectiveLoadIndex</name>
+            <datapointname>EffectiveLoadIndex</datapointname>
+            <cf>1</cf>
+            <aggregateMethod>sum</aggregateMethod>
+            <originId></originId>
+        </overviewgraphdatapoint>
+            </datapoints>
+            <virtualdatapoints>
+            </virtualdatapoints>
+            <lines>
+            <overviewgraphline>
+                <type>1</type>
+                <legend>##INSTANCE##</legend>
+                <datapointname>EffectiveLoadIndex</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+                <color>silver</color>
+            </overviewgraphline>
+            </lines>
+        </overviewgraph>
+        <overviewgraph>
+            <name>Memory Usage</name>
+            <title>Top Memory Usage</title>
+            <verticallabel>percent</verticallabel>
+            <rigid>false</rigid>
+            <maxvalue>100.0</maxvalue>
+            <minvalue>0.0</minvalue>
+            <displayprio>3</displayprio>
+            <timescale>1day</timescale>
+            <base1024>false</base1024>
+            <aggregated>false</aggregated>
+            <originId></originId>
+            <datapoints>
+        <overviewgraphdatapoint>
+            <name>PercentMemory</name>
+            <datapointname>PercentMemory</datapointname>
+            <cf>1</cf>
+            <aggregateMethod>sum</aggregateMethod>
+            <originId></originId>
+        </overviewgraphdatapoint>
+            </datapoints>
+            <virtualdatapoints>
+            </virtualdatapoints>
+            <lines>
+            <overviewgraphline>
+                <type>1</type>
+                <legend>##INSTANCE##</legend>
+                <datapointname>PercentMemory</datapointname>
+                <isvirtualdatapoint>false</isvirtualdatapoint>
+                <color>silver</color>
+            </overviewgraphline>
+            </lines>
+        </overviewgraph>
+        </overviewgraphs>
+        <scripts>
+        </scripts>
+    </entry>
+</feed>
