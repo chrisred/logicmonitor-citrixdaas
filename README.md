@@ -12,6 +12,8 @@ currently there are duplicate sections between files.
 
 ## Usage
 
+Each module can be imported into a LogicMonitor tenant using the Add > From File option.
+
 The modules work with both Citrix Cloud (DaaS) and
 [Citrix VAD](https://www.citrix.com/products/citrix-daas/citrix-virtual-apps-and-desktops.html) for on-premises setups.
 The `CitrixDaaS_Token.xml` module contains notes on how to setup the Citrix Cloud API credentials, the other modules
