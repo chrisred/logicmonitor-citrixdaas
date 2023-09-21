@@ -57,13 +57,11 @@ try
     def mainUriBuilder = new URIBuilder()
         .setScheme('https')
         .setHost(propHost)
-        .setPath('/monitorodata/Applications')
-        .setParameter('$select', 'Id')
-        .setParameter(
-            '$expand',
-            'ApplicationInstances($select=Session;$expand=Session($select=StartDate,EndDate,ConnectionState;' + 
-            '$filter=EndDate eq null))'
-        )
+        .setPath('/monitorodata/ApplicationInstances')
+        .setParameter('$select', 'ApplicationId,EndDate')
+        .setParameter('$expand', 'Session($Select=ConnectionState)')
+        .setParameter('$filter', 'EndDate eq null')
+        .setParameter('$orderby', 'StartDate Desc')
 
     if (isCitrixCloud)
     {
@@ -81,7 +79,7 @@ try
     {
         // modify request for an on-prem delivery controller
         mainUriBuilder.setScheme(propScheme)
-        mainUriBuilder.setPath('/Citrix/Monitor/OData/v4/Data/Applications')
+        mainUriBuilder.setPath('/Citrix/Monitor/OData/v4/Data/ApplicationInstances')
 
         def credDomain = null
         if (propUser && propPass && propUser.contains('\\'))
@@ -114,22 +112,32 @@ try
         return 4
     }
 
-    mainResponse.json.value.each { application ->
-        def wildValue = application.Id
+    def instancesByApplication = [:]
+    mainResponse.json.value.each { instance ->
+        def applicationId =  instance.ApplicationId
+        def instanceList = instancesByApplication.get(applicationId, [])
+        instanceList << instance
+        instancesByApplication[applicationId] = instanceList
+    }
 
-        def instancesCount = 0
-        def instanceStateCount = connectionStateMap.collectEntries {[it.key, 0]}
+    instancesByApplication.each { applicationId, instances ->
+        def wildValue = applicationId
 
-        application.ApplicationInstances.each { instance ->
-            instancesCount++
-            instanceStateCount[instance.Session.ConnectionState]++
+        // initialise all the connection state types with 0 to start
+        def connectionStateCount = [
+            0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0
+        ]
+
+        // for each instance increment the connection state count
+        instances.each { instance ->
+            connectionStateCount[instance.Session.ConnectionState] += 1
         }
 
-        instanceStateCount.each { key, value ->
-            output("Instances${connectionStateMap[key]}", value, wildValue)
+        connectionStateCount.each {
+            output("Instances${connectionStateMap[it.key]}", it.value, wildValue)
         }
 
-        output('TotalInstances', instancesCount, wildValue)
+        output('TotalInstances', instances.size(), wildValue)
     }
 
     return 0
