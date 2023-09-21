@@ -110,10 +110,12 @@ try
     mainResponse.json.value.each { application ->
         def wildValue = application.Id
         def wildAlias = application.Name
+        def adminFolder = application.AdminFolder.replace('/', '-') ?: 'Applications'
 
         def instanceProperties = [
             'citrixdaas.applicationtype' : applicationTypeMap.getOrDefault(application.ApplicationType, -1),
             'citrixdaas.enabled' : application.Enabled,
+            'citrixdaas.adminfolder' : adminFolder,
             'citrixdaas.lifecyclestate' : lifecycleStateMap.getOrDefault(application.LifecycleState, -1)
         ]
 
