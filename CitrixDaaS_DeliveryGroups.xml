@@ -5,7 +5,7 @@
   <errmsg>OK</errmsg>
   <interval>0</interval>
     <entry type="predatasource">
-        <version>1695237149</version>
+        <version>1695329749</version>
         <name>CitrixDaaS_DeliveryGroups</name>
         <displayedas>Citrix DaaS Delivery Groups</displayedas>
         <description>Session and Machine status at the Delivery Group level.</description>
@@ -1049,35 +1049,6 @@ void output(key, value, instanceId=null)
             <alertClearTransitionIval>0</alertClearTransitionIval>
         </datapoint>
         <datapoint>
-            <name>SessionsTerminated</name>
-            <originId>duEcHQe5RGeSOUR6p_Yj4Q</originId>
-            <dataType>7</dataType>
-            <type>2</type>
-            <postprocessormethod>namevalue</postprocessormethod>
-            <postprocessorparam>##WILDVALUE##.SessionsTerminated</postprocessorparam>
-            <usevalue>output</usevalue>
-            <alertexpr></alertexpr>
-            <alertmissing>1</alertmissing>
-            <alertsubject></alertsubject>
-            <alertbody></alertbody>
-            <enableanomalyalertsuppression></enableanomalyalertsuppression>
-            <adadvsettingenabled>false</adadvsettingenabled>
-            <warnadadvsetting></warnadadvsetting>
-            <erroradadvsetting></erroradadvsetting>
-            <criticaladadvsetting></criticaladadvsetting>
-            <description>The number of sessions that have been terminated.</description>
-            <maxvalue></maxvalue>
-            <minvalue></minvalue>
-            <maxdigits>4</maxdigits>
-            <userparam1></userparam1>
-            <userparam2></userparam2>
-            <userparam3></userparam3>
-            <iscomposite>false</iscomposite>
-            <rpn></rpn>
-            <alertTransitionIval>0</alertTransitionIval>
-            <alertClearTransitionIval>0</alertClearTransitionIval>
-        </datapoint>
-        <datapoint>
             <name>SessionsUnknown</name>
             <originId>O9vK9OnJTFazAGtG8Lcqnw</originId>
             <dataType>7</dataType>
@@ -1715,12 +1686,6 @@ This started at ##START##, or ##DURATION## ago.</alertbody>
             <cf>1</cf>
         </graphdatapoint>
         <graphdatapoint>
-            <name>SessionsTerminated</name>
-            <datapointname>SessionsTerminated</datapointname>
-            <originId></originId>
-            <cf>1</cf>
-        </graphdatapoint>
-        <graphdatapoint>
             <name>SessionsUnknown</name>
             <datapointname>SessionsUnknown</datapointname>
             <originId></originId>
@@ -1784,13 +1749,6 @@ This started at ##START##, or ##DURATION## ago.</alertbody>
                 <legend>Reconnecting</legend>
                 <color>lime</color>
                 <datapointname>SessionsReconnecting</datapointname>
-                <isvirtualdatapoint>false</isvirtualdatapoint>
-            </graphdata>
-            <graphdata>
-                <type>3</type>
-                <legend>Terminated</legend>
-                <color>lime</color>
-                <datapointname>SessionsTerminated</datapointname>
                 <isvirtualdatapoint>false</isvirtualdatapoint>
             </graphdata>
             <graphdata>
